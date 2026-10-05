@@ -29,39 +29,11 @@ from ...core.attention.attention_cte import (
 from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import div_ceil
 from ...core.utils.modular_allocator import ModularAllocator
-from ...core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 
 # Maximum number of Q groups to process per output tile in the reduction
 # and normalization loops.
 _MAX_GRPS_PER_TILE = 128
 _FULLY_MASKED_LSE_THRESHOLD = -1.0e30
-
-
-def _load_rank_sb(iota_nw, scalar_rank, qts):
-    """
-    Load a dynamic rank ID into a (qts, 1) float32 SBUF tensor.
-
-    Uses indirect DMA with scalar_offset=scalar_rank to read iota_nw[scalar_rank]
-    directly into SBUF, then stream_shuffle_broadcast to replicate across all
-    partitions. This pattern (matching ring_attention_bwd) avoids register_store,
-    whose scheduling can be reordered across ring steps on trn3 cp=4 lnc=2
-    striped causal.
-
-    Args:
-        iota_nw (nl.NkiTensor): [1, num_workers] HBM iota table containing [0, 1, ..., num_workers-1].
-        scalar_rank: Dynamic rank ID (index type from collective_permute).
-        qts (int): Q sequence tile size (partition dimension).
-
-    Returns:
-        nl.NkiTensor: [qts, 1], Rank ID broadcast to all partitions in SBUF as float32.
-    """
-    sb = nl.ndarray((qts, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(
-        dst=sb[0, 0],
-        src=iota_nw.ap(pattern=[[1, 1], [1, 1]], offset=0, scalar_offset=scalar_rank, indirect_dim=1),
-    )
-    stream_shuffle_broadcast(src=sb, dst=sb)
-    return sb
 
 
 def _reduce_attention_stats(
@@ -557,30 +529,56 @@ def _tiled_reduce_attention(
     allocator.set_current_address(init_addr)
 
 
-def _compute_cp_offset(rank_id_sb, recv_rank_sb, cp_offset_hbm, seqlen, striped_input):
-    """Compute cp_offset for a ring step and write it to HBM.
+def _compute_cp_offsets(iota_nw_sb, replica_group, num_workers, seqlen, striped_input):
+    """Compute every ring step's cp_offset in SBUF and spill them to HBM in one DMA.
 
     For striped mode: cp_offset = 0 if q_rank >= kv_rank, else -1.
     For contiguous mode: cp_offset = (my_rank - recv_rank) * seqlen.
 
+    recv_rank is a runtime value, so it is turned into data by indexing the iota
+    table with it (table[recv_rank] == recv_rank). This uses scalar_offset
+    indirection rather than register_store, whose scheduling can be reordered
+    across ring steps on trn3 cp=4 lnc=2 striped causal.
+
     Args:
-        rank_id_sb (nl.NkiTensor): [_Q_GRP_SZ, 1], Current rank ID broadcast in SBUF.
-        recv_rank_sb (nl.NkiTensor): [_Q_GRP_SZ, 1], Received rank ID broadcast in SBUF.
-        cp_offset_hbm (nl.NkiTensor): [1, 1], Output HBM tensor for attention_cte.
+        iota_nw_sb (nl.NkiTensor): [1, num_workers], SBUF iota table containing [0, 1, ..., num_workers-1].
+        replica_group (ReplicaGroup): Ring replica group.
+        num_workers (int): CP degree, i.e. number of ring steps.
         seqlen (int): Sequence length (used in contiguous mode).
         striped_input (bool): Whether input is striped across ranks.
+
+    Returns:
+        nl.NkiTensor: [1, num_workers], HBM cp_offset table indexed by ring step.
     """
+    # Rank whose K/V this rank processes at each ring step, one free-dim slot per
+    # step. Step 0 processes the local K/V, so slot 0 holds my own rank.
+    recv_ranks_sb = nl.ndarray((1, num_workers), dtype=nl.float32, buffer=nl.sbuf)
+    for step in range(num_workers):
+        recv_rank = ncc.collective_permute_implicit_current_processing_rank_id(
+            iteration_id=step,
+            replica_group=replica_group,
+        )
+        nisa.tensor_copy(
+            dst=recv_ranks_sb[0:1, step : step + 1],
+            src=iota_nw_sb.ap(pattern=[[num_workers, 1], [1, 1]], offset=0, scalar_offset=recv_rank, indirect_dim=1),
+        )
+
+    rank_id_sb = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=rank_id_sb, src=recv_ranks_sb[:, 0:1])
+
+    cp_off_sb = nl.ndarray((1, num_workers), dtype=nl.float32, buffer=nl.sbuf)
     if striped_input:
         # cp_offset = -float(q_rank < kv_rank) (i.e., 0.0 or -1.0)
-        cp_off_sb = nl.ndarray((_Q_GRP_SZ, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(cp_off_sb, rank_id_sb, recv_rank_sb, op=nl.less)
+        nisa.tensor_scalar(cp_off_sb, recv_ranks_sb, nl.greater, rank_id_sb)
         nisa.tensor_scalar(cp_off_sb, cp_off_sb, nl.multiply, -1.0)
     else:
         # cp_offset = (my_rank - recv_rank) * seqlen
-        cp_off_sb = nl.ndarray((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(cp_off_sb, rank_id_sb, recv_rank_sb, op=nl.subtract)
-        nisa.tensor_scalar(cp_off_sb, cp_off_sb, nl.multiply, float(seqlen))
-    nisa.dma_copy(dst=cp_offset_hbm, src=cp_off_sb[0, 0])
+        nisa.tensor_scalar(cp_off_sb, recv_ranks_sb, nl.subtract, rank_id_sb)
+        nisa.tensor_scalar(cp_off_sb, cp_off_sb, nl.multiply, -float(seqlen))
+
+    cp_offset_hbm = nl.ndarray((1, num_workers), dtype=nl.float32, buffer=nl.shared_hbm, name="cp_offset_hbm")
+    nisa.dma_copy(dst=cp_offset_hbm, src=cp_off_sb)
+    return cp_offset_hbm
 
 
 def _normalize_one_batch(
@@ -1090,29 +1088,21 @@ def ring_attention_spmd_fwd(
     # Create ReplicaGroup once and reuse across all ring steps.
     replica_group = ReplicaGroup(replica_groups)
 
-    # For causal masking, rank IDs are needed to compute cp_offset per ring step.
-    # cp_offset_hbm is a (1,1) shared HBM tensor that gets updated each ring step.
+    """
+    For causal masking, all ring steps' cp_offset are computed up front into one
+    (1, num_workers) HBM table, indexed by ring step. attention_cte re-reads
+    cp_offset from HBM once per batch, and the unrolled ring loop does not order
+    those reads against later steps' writes, so each step needs its own slot and
+    the table must be fully written before the first read.
+    """
     cp_offset_hbm = None
     if use_causal_mask:
         iota_nw_sb = nl.ndarray((1, num_workers), dtype=nl.float32, buffer=nl.sbuf)
         nisa.iota(iota_nw_sb, [[1, num_workers]], offset=0)
-        iota_nw = nl.ndarray((1, num_workers), dtype=nl.float32, buffer=nl.shared_hbm, name="iota_nw")
-        nisa.dma_copy(dst=iota_nw, src=iota_nw_sb)
 
-        rank_id = ncc.collective_permute_implicit_current_processing_rank_id(
-            iteration_id=0,
-            replica_group=replica_group,
-        )
-        rank_id_sb = _load_rank_sb(iota_nw, rank_id, _Q_GRP_SZ)
-        cp_offset_hbm = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+        cp_offset_hbm = _compute_cp_offsets(iota_nw_sb, replica_group, num_workers, seqlen, striped_input)
 
     allocator = ModularAllocator(initial_address=0)
-
-    # Ring step 0: Local K/V (Q and K from same rank => cp_offset=0)
-    if use_causal_mask:
-        _cp_zero_sb = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(_cp_zero_sb, 0.0)
-        nisa.dma_copy(dst=cp_offset_hbm, src=_cp_zero_sb)
 
     """
     attention_cte handles LNC sharding and batch iteration internally.
@@ -1130,7 +1120,7 @@ def ring_attention_spmd_fwd(
         tp_k=tp_k,
         tp_out=False,
         cache_softmax=True,
-        cp_offset=cp_offset_hbm if use_causal_mask else None,
+        cp_offset=cp_offset_hbm[:, 0:1] if use_causal_mask else None,
         global_cp_deg=num_workers if use_causal_mask else None,
         cp_striped_input=striped_input,
         skip_output_normalization=True,
@@ -1175,15 +1165,6 @@ def ring_attention_spmd_fwd(
         )
 
     for ring_step in nl.sequential_range(1, num_workers):
-        # For causal masking, compute cp_offset for this ring step.
-        if use_causal_mask:
-            recv_rank = ncc.collective_permute_implicit_current_processing_rank_id(
-                iteration_id=ring_step,
-                replica_group=replica_group,
-            )
-            recv_rank_sb = _load_rank_sb(iota_nw, recv_rank, _Q_GRP_SZ)
-            _compute_cp_offset(rank_id_sb, recv_rank_sb, cp_offset_hbm, seqlen, striped_input)
-
         # Run attention_cte with K/V in nxt buffers (collective already landed).
         o_curr, neg_max_curr, sum_curr = attention_cte(
             q,
@@ -1195,7 +1176,7 @@ def ring_attention_spmd_fwd(
             tp_k=tp_k,
             tp_out=False,
             cache_softmax=True,
-            cp_offset=cp_offset_hbm if use_causal_mask else None,
+            cp_offset=cp_offset_hbm[:, ring_step : ring_step + 1] if use_causal_mask else None,
             global_cp_deg=num_workers if use_causal_mask else None,
             cp_striped_input=striped_input,
             skip_output_normalization=True,

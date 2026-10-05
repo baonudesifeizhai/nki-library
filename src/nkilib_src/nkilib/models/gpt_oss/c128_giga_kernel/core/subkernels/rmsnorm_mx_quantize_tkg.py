@@ -22,7 +22,8 @@ import nki.language as nl
 
 from ..mlp.mlp_tkg.projection_mx_constants import _q_width
 from ..quantization.fp8_quantize import row_quantization, static_quantization
-from ..utils.kernel_helpers import div_ceil
+from ..utils.dma_names import dma_name
+from ..utils.kernel_helpers import div_ceil, kernel_assert
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from .norm_tkg_utils import _1B_XPOSE_PSUM_STEP, _MX_SCALE_DTYPE, _UINT8_TP_VIEW_DTYPE, validate_rmsnorm_mx_quantize_tkg
 
@@ -61,7 +62,8 @@ def rmsnorm_mx_quantize_tkg(
         H1: H // H0
 
     Args:
-        input (nl.NkiTensor): [B, S, H], Input tensor on HBM.
+        input (nl.NkiTensor): [B, S, H] input on HBM, or [B*S, 1, H] input on SBUF.
+            SBUF input uses B*S as its partition dimension and does not support residual add.
         gamma (nl.NkiTensor): [1, H], RMSNorm scaling weights on HBM.
         output (nl.NkiTensor): [H0, B*S, H1], FP16/BF16 output tensor in SBUF.
         output_quant (Optional[nl.NkiTensor]): [H0, H/512, B*S], FP8x4 quantized output tensor in HBM or SBUF,
@@ -124,6 +126,7 @@ def rmsnorm_mx_quantize_tkg(
     """
 
     # Step 1: Configuration, validation
+    input_in_sbuf = input.buffer == nl.sbuf
     dims, cfg = validate_rmsnorm_mx_quantize_tkg(
         input_shape=input.shape,
         gamma_shape=gamma.shape,
@@ -144,6 +147,23 @@ def rmsnorm_mx_quantize_tkg(
         is_static_mx=is_static_mx,
         has_output_input_dequant_scale=output_input_dequant_scale != None,
     )
+
+    if input_in_sbuf:
+        kernel_assert(
+            dims.S == 1,
+            "SBUF input must have shape [B*S, 1, H] so B*S is the partition dimension",
+        )
+        kernel_assert(not cfg.is_residual_add, "SBUF input does not support fused residual add")
+        kernel_assert(not cfg.do_shard, "SBUF input must already contain the local token shard")
+        kernel_assert(
+            input.dtype in [nl.float16, nl.bfloat16],
+            "SBUF input must use a 16-bit dtype",
+        )
+        transpose_token_stride = div_ceil(cfg.BxS_tile_size * 2, 4) * 2
+        kernel_assert(
+            transpose_token_stride * dims.H1 <= dims.psum_fmax,
+            "SBUF input transpose must fit in one PSUM bank",
+        )
 
     # Step 2: Allocate buffers, load weights/constants
     residual_sb = (
@@ -178,7 +198,7 @@ def rmsnorm_mx_quantize_tkg(
     gamma_hbm = gamma.flatten_dims(start_dim=0, end_dim=1)
     gamma_hbm_view = gamma_hbm.reshape_dim(dim=0, shape=[dims.H1, dims.H0]).expand_dim(dim=1).expand_dim(dim=1)
     gamma_sb_view = gamma_sb.expand_dim(dim=1).expand_dim(dim=1)
-    nisa.dma_transpose(dst=gamma_sb_view, src=gamma_hbm_view)
+    nisa.dma_transpose(dst=gamma_sb_view, src=gamma_hbm_view, name=dma_name("prequant_gamma_load"))
 
     # STATIC_MX pre-quantization for E_L=1 case (currently not used): Load and broadcast input dequant scale once before tile loop.
     # When gate_up_in_scale=None for STATIC_MX, quantization is skipped (handled per-expert downstream in expert MLP loop).
@@ -186,9 +206,13 @@ def rmsnorm_mx_quantize_tkg(
         nisa.dma_copy(dst=output_input_dequant_scale[:1, :], src=gate_up_in_scale[0:1, :])
         stream_shuffle_broadcast(src=output_input_dequant_scale, dst=output_input_dequant_scale)
 
-    # Reshape HBM views for loading with NkiTensor
+    # Reshape input for either on-chip or HBM transpose.
     residual_hbm_view = residual.reshape((dims.B * dims.S * dims.H1, dims.H0)) if cfg.is_residual_add else None
-    input_hbm_view = input.reshape((dims.B * dims.S * dims.H1, dims.H0))
+    input_view = (
+        input.reshape((dims.B * dims.S, dims.H1, dims.H0))
+        if input_in_sbuf
+        else input.reshape((dims.B * dims.S * dims.H1, dims.H0))
+    )
 
     # Step 3: Process tiles - Residual Add + RMSNorm + MX Quantization
     for bxs_tile_idx in range(cfg.num_BxS_tiles):
@@ -208,7 +232,8 @@ def rmsnorm_mx_quantize_tkg(
         hidden_sb = _load_hidden_compute_residual(
             dims=dims,
             cfg=cfg,
-            input_hbm_view=input_hbm_view,
+            input_view=input_view,
+            input_in_sbuf=input_in_sbuf,
             residual_hbm_view=residual_hbm_view,
             input_tile_sb=input_tile_sb,
             residual_sb=residual_sb,
@@ -372,7 +397,8 @@ def rmsnorm_mx_quantize_tkg(
 def _load_hidden_compute_residual(
     dims,
     cfg,
-    input_hbm_view,
+    input_view,
+    input_in_sbuf,
     residual_hbm_view,
     input_tile_sb,
     residual_sb,
@@ -380,9 +406,30 @@ def _load_hidden_compute_residual(
     tile_BxS_start_idx,
     residual_tile_BxS_slice,
 ):
-    """Load input (+ optional residual) from HBM with DMA transpose and compute residual add."""
+    """Transpose input into the H0-partitioned RMSNorm layout and optionally add a residual."""
+    if input_in_sbuf:
+        # nc_transpose destinations must be 4-byte aligned. Pack all H1 transposes
+        # into one PSUM bank and expose the result as logical [H0, BxS, H1].
+        transpose_token_stride = div_ceil(cfg.BxS_tile_size * 2, 4) * 2
+        input_transposed_psum = nl.ndarray(
+            (dims.H0, dims.H1, transpose_token_stride),
+            dtype=input_view.dtype,
+            buffer=nl.psum,
+        )
+        input_tile = input_view.slice(
+            dim=0,
+            start=tile_BxS_start_idx,
+            end=tile_BxS_start_idx + cfg.BxS_tile_size,
+        )
+        for h1_idx in nl.affine_range(dims.H1):
+            nisa.nc_transpose(
+                dst=input_transposed_psum[:, h1_idx, 0 : cfg.BxS_tile_size],
+                data=input_tile[:, h1_idx, :],
+            )
+        return input_transposed_psum[:, :, 0 : cfg.BxS_tile_size].permute([0, 2, 1])
+
     input_src_view = (
-        input_hbm_view.slice(dim=0, start=hbm_tile_offset, end=hbm_tile_offset + cfg.BxS_tile_size * dims.H1)
+        input_view.slice(dim=0, start=hbm_tile_offset, end=hbm_tile_offset + cfg.BxS_tile_size * dims.H1)
         .expand_dim(dim=1)
         .expand_dim(dim=1)
     )
@@ -402,8 +449,12 @@ def _load_hidden_compute_residual(
         )
 
         # Transpose load residual and input
-        nisa.dma_transpose(dst=residual_dst_view, src=residual_src_view)
-        nisa.dma_transpose(dst=input_dst_view, src=input_src_view)
+        nisa.dma_transpose(
+            dst=residual_dst_view, src=residual_src_view, name=dma_name(f"prequant_residual_load_t{tile_BxS_start_idx}")
+        )
+        nisa.dma_transpose(
+            dst=input_dst_view, src=input_src_view, name=dma_name(f"prequant_hidden_load_t{tile_BxS_start_idx}")
+        )
 
         # Residual add: hidden = input + residual
         nisa.tensor_tensor(
@@ -415,7 +466,9 @@ def _load_hidden_compute_residual(
         hidden_sb = residual_sb[:, residual_tile_BxS_slice, :]
     else:
         # Transpose load input
-        nisa.dma_transpose(dst=input_dst_view, src=input_src_view)
+        nisa.dma_transpose(
+            dst=input_dst_view, src=input_src_view, name=dma_name(f"prequant_hidden_load_t{tile_BxS_start_idx}")
+        )
         hidden_sb = input_tile_sb
 
     return hidden_sb
@@ -694,6 +747,7 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
         nisa.dma_copy(
             src=src_3d,
             dst=dst_tile,
+            name=dma_name(f"prequant_spill_full_f{dst_free_offset}_b{BxS_offset}"),
         )
     elif remainder == 0:
         # Single full tile
@@ -704,6 +758,7 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
         nisa.dma_copy(
             src=src_tile,
             dst=dst_tile,
+            name=dma_name(f"prequant_spill_single_f{dst_free_offset}_b{BxS_offset}"),
         )
     else:
         # Has partial last tile
@@ -720,6 +775,7 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
             nisa.dma_copy(
                 src=src_3d,
                 dst=dst_tile,
+                name=dma_name(f"prequant_spill_full_f{dst_free_offset}_b{BxS_offset}"),
             )
         elif num_full_tiles == 1:
             # Single full tile
@@ -730,6 +786,7 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
             nisa.dma_copy(
                 src=src_tile,
                 dst=dst_tile,
+                name=dma_name(f"prequant_spill_single_f{dst_free_offset}_b{BxS_offset}"),
             )
         # Single DMA for partial last tile
         partial_offset = num_full_tiles * pmax
@@ -740,4 +797,5 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
         nisa.dma_copy(
             src=src_partial,
             dst=dst_partial,
+            name=dma_name(f"prequant_spill_partial_f{dst_free_offset}_b{BxS_offset}"),
         )

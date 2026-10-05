@@ -37,10 +37,11 @@ class CheckpointLayout(Enum):
             destination contiguous, so the DMA coalesces into max-size packets.
         TRANSPOSED: Store the per-block activation transposed to an I_TP-major
             layout ([..., I_TP, B]), which is what the MXFP8 MoE backward consumes.
-            NOT CURRENTLY IMPLEMENTED — the forward's block-granular store path
-            supports DIRECT only and raises on TRANSPOSED. The previous per-tile
-            transposed store was removed because storing a tile at a time wrote only
-            ``tile_n`` of each token row, splitting every store into tiny
+            Implemented by a block-granular store that PE-transposes the block in
+            ``<=TILE_M`` I_TP chunks into a token-ordered staging buffer, then issues
+            one coalesced DMA per chunk (each stored I_TP row is a contiguous token
+            run). This is distinct from the removed per-tile transposed store, which
+            wrote only ``tile_n`` of each token row and split every store into tiny
             (~1 KiB) DMA packets that bottlenecked the kernel.
     """
 
@@ -65,36 +66,21 @@ def checkpoint_block_dims(layout: "CheckpointLayout", I_TP: int, block_size: int
 
 @dataclass(frozen=True)
 class MXFP8MOECheckpointConfig(nl.NKIObject):
-    """Which MXFP8 MoE activation checkpoints are exchanged between fwd and bwd.
+    """Whether the forward emits the gate/up activation checkpoint for the backward.
 
-    The forward can emit two activation checkpoints for the MXFP8 MoE backward.
-    Each ``save_*`` flag independently controls whether its checkpoint is saved:
-    on the forward side a disabled checkpoint is not computed/stored/allocated/
-    returned; on the backward side (future) a disabled checkpoint is recomputed
-    instead of being read. The gate/up checkpoint is required by the current
-    backward, so it defaults to saved.
+    ``save_gate_up_proj_act`` controls whether the forward saves
+    gate_up_proj_act_checkpoint_T: when disabled the checkpoint is not computed/
+    stored/allocated/returned (the backward recomputes it). The gate/up checkpoint
+    is required by the current backward, so it defaults to saved.
 
-    Each ``*_layout`` field independently selects that checkpoint's store layout
-    (see ``CheckpointLayout``). Both default to DIRECT, the only layout the
-    forward's block-granular store currently implements; the tensors keep their
-    ``_T`` output names for continuity with the backward's parameter names.
-    TRANSPOSED (the layout the backward consumes) is not currently supported and
-    raises at trace time — restoring it means adding a block-level transposed
-    store to the forward, not a per-tile one.
+    The checkpoint's store LAYOUT is no longer a flag here — it is derived from the
+    ``gate_up_proj_act_td`` orientation on ``MXFP8MOEFwdConfig`` (F_BY_K -> DIRECT,
+    K_BY_F -> TRANSPOSED). The scaled-intermediate checkpoint is not emitted (the
+    backward never consumed it).
 
     Args:
         save_gate_up_proj_act (bool): Save gate_up_proj_act_checkpoint_T (clamped
             gate/up pre-activations). Required by the current backward.
-        save_scaled_intermediate (bool): Save scaled_intermediate_checkpoint_T
-            (SiLU(gate)*up*EA) so the backward can skip its Phase-1 recompute +
-            Phase-4 transpose.
-        gate_up_proj_act_layout (CheckpointLayout): Store layout for the gate/up
-            checkpoint. TRANSPOSED -> [N, 2, I_TP, B]; DIRECT -> [N, 2, B, I_TP].
-        scaled_intermediate_layout (CheckpointLayout): Store layout for the scaled
-            intermediate. TRANSPOSED -> [N, I_TP, B]; DIRECT -> [N, B, I_TP].
     """
 
     save_gate_up_proj_act: bool = True
-    save_scaled_intermediate: bool = True
-    gate_up_proj_act_layout: CheckpointLayout = CheckpointLayout.DIRECT
-    scaled_intermediate_layout: CheckpointLayout = CheckpointLayout.DIRECT

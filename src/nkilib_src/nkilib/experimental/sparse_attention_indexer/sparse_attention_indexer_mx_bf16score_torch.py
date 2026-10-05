@@ -32,9 +32,11 @@ import numpy as np
 import torch
 from neuron_dtypes import static_cast
 
+from ..mla.deepseek.mla_common_cte import MlaPrecision, RopeLayout
 from .sparse_attention_indexer_torch import (
     _block32_mx_quant_dequant,
     _layernorm_ref,
+    _rope_interleaved_ref,
     _rope_non_interleaved_ref,
 )
 
@@ -129,8 +131,12 @@ def sparse_attention_indexer_mx_bf16score_torch_ref(
     end_pos_arg=None,
     emit_flat_topk=False,
     emit_tiled_topk=False,
+    compact_scales=False,
+    precision=MlaPrecision.MX,
+    rope_layout=RopeLayout.HALF_SPLIT,
+    qr_bf16_hbm=None,
 ):
-    """Reference for the MX-projections + BF16-score kernel.
+    """Reference for the MX- or BF16-projections + BF16-score kernel.
 
     Signature mirrors ``sparse_attention_indexer_mx_bf16score``: qr is consumed
     pre-quantized via ``qr_qtz_hbm``/``qr_scale_hbm`` (an upstream QKV kernel),
@@ -140,12 +146,15 @@ def sparse_attention_indexer_mx_bf16score_torch_ref(
     noise on the projection inputs is replayed here to match the kernel.
 
     Only the default fused ``phase="all"`` self-attention path is modelled; the
-    CP phase / topk-output-format flags are accepted for signature parity with
-    the kernel and are otherwise unused here.
+    CP phase / topk-output-format / scale-layout flags are accepted for signature
+    parity with the kernel and are otherwise unused here (the weights arrive already
+    dequantized, so the compact-vs-native scale layout is a kernel-side detail).
     """
     del wq_b_scale, wk_scale, k_scale_cache, x_non_mx, x_mx_data, x_mx_scale
     del use_hadamard  # bf16-score kernel never applies Hadamard
-    del k_seq_out_hbm, end_pos_arg, emit_flat_topk, emit_tiled_topk
+    del k_seq_out_hbm, end_pos_arg, emit_flat_topk, emit_tiled_topk, compact_scales
+    _bf16 = precision.is_bf16()
+    _rope_ref = _rope_interleaved_ref if rope_layout.is_interleaved() else _rope_non_interleaved_ref
     M, dim = x.shape
     S = M // batch_size
     q_lora_rank = wq_b.shape[0]
@@ -157,8 +166,15 @@ def sparse_attention_indexer_mx_bf16score_torch_ref(
     do_kproj_only = phase == "kproj"
     k_seq_out = torch.zeros((M, head_dim), dtype=torch.float32) if do_kproj_only else None
 
-    # Reconstruct the MX-rounded qr the kernel consumes from its pre-quantized latent.
-    qr = torch.from_numpy(_dequant_swizzled_qr(qr_qtz_hbm, qr_scale_hbm, M, q_lora_rank))
+    """
+    qr: BF16 takes it verbatim (the bf16 QKV kernel exports plain [M, q_lora_rank]); MX
+    reconstructs the MX-rounded values the kernel actually matmuls from its pre-quantized latent.
+    """
+    if _bf16:
+        qr = qr_bf16_hbm if isinstance(qr_bf16_hbm, torch.Tensor) else torch.from_numpy(np.asarray(qr_bf16_hbm))
+        qr = qr.to(torch.float32)
+    else:
+        qr = torch.from_numpy(_dequant_swizzled_qr(qr_qtz_hbm, qr_scale_hbm, M, q_lora_rank))
     combined_scale = (1.0 / math.sqrt(n_heads)) * (1.0 / math.sqrt(head_dim))
 
     # Prior positions [0, start_pos) score against the zero-filled prior K cache,
@@ -174,16 +190,22 @@ def sparse_attention_indexer_mx_bf16score_torch_ref(
         bs = batch_idx * S
         be = bs + S
 
-        # MX-projection noise on activations (matches kernel's nc_matmul_mx
-        # quantization of qr and x for Q-proj and K-proj).
-        x_arg = _block32_mx_quant_dequant(x[bs:be])
+        """
+        Projection-input rounding. MX: block-32 quant/dequant, matching nc_matmul_mx's
+        quantization of x and qr. BF16: plain bf16 rounding (the tensor engine still
+        accumulates in fp32).
+        """
+        if _bf16:
+            x_arg = x[bs:be].to(torch.bfloat16).to(torch.float32)
+        else:
+            x_arg = _block32_mx_quant_dequant(x[bs:be])
 
         # K projection + LayerNorm + RoPE.
         k = x_arg @ wk.T
         k = _layernorm_ref(k, k_norm_gamma, k_norm_beta)
         k_pe = k[:, :rope_head_dim]
         k_nope = k[:, rope_head_dim:]
-        k_pe = _rope_non_interleaved_ref(k_pe, cos_t, sin_t)
+        k_pe = _rope_ref(k_pe, cos_t, sin_t)
         k = torch.cat([k_pe, k_nope], dim=-1)
 
         # phase="kproj": emit only the projected K (seq-major), skip Q/score/topk.
@@ -192,14 +214,14 @@ def sparse_attention_indexer_mx_bf16score_torch_ref(
             continue
 
         # Q projection.
-        qr_arg = _block32_mx_quant_dequant(qr[bs:be])
+        qr_arg = qr[bs:be].to(torch.bfloat16).to(torch.float32) if _bf16 else _block32_mx_quant_dequant(qr[bs:be])
         q = qr_arg @ wq_b
         q = q.reshape(S, n_heads, head_dim)
 
         # Q RoPE (per head).
         q_pe = q[:, :, :rope_head_dim]
         q_nope = q[:, :, rope_head_dim:]
-        q_pe = _rope_non_interleaved_ref(q_pe, cos_t.unsqueeze(1), sin_t.unsqueeze(1))
+        q_pe = _rope_ref(q_pe, cos_t.unsqueeze(1), sin_t.unsqueeze(1))
         q = torch.cat([q_pe, q_nope], dim=-1)
 
         # NO Hadamard. NO MX quant on Q/K. Cast to bf16 then back to f32 to

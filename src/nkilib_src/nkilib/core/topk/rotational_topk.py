@@ -265,9 +265,9 @@ def _topk_rotated_core(
     config: RotationalTopkConfig,
     batch_start: int,
     batch_end: int,
-    rotation: nl.ndarray,
-    rotation_f32: nl.ndarray,
-    indices: nl.ndarray,
+    rotation: nl.NkiTensor,
+    rotation_f32: nl.NkiTensor,
+    indices: nl.NkiTensor,
 ) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Core rotational top-k algorithm implementation.

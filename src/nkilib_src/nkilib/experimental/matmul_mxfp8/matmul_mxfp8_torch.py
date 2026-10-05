@@ -23,6 +23,8 @@ import numpy as np
 from neuronxcc.nki._private.private_api import float8_e4m3fn_x4, float8_e5m2_x4
 from neuronxcc.nki._private.test import mx_util
 
+from ..mxfp_utils.mxfp8_utils.common_dataclasses import TensorOrientation
+
 # Swizzle interleave factor (must match hardware constant)
 _INTERLEAVE_FACTOR = 4
 
@@ -192,11 +194,12 @@ def matmul_mxfp8_torch_ref(
     lhs_is_swizzled=True,
     rhs_is_swizzled=True,
     load_with_PE_swizzle=False,
-    lhs_is_f_by_k=True,
-    rhs_is_f_by_k=True,
+    lhs_orientation=None,
+    rhs_orientation=None,
     fast_dma_transpose=False,
     enable_psum_copy_in=None,
     quant_scheme="wrapX",
+    disable_dma_transpose=False,
 ):
     """Compute golden matmul output for MXFP8 matrix multiplication.
 
@@ -226,17 +229,14 @@ def matmul_mxfp8_torch_ref(
     lhs_prequantized = lhs_scales is not None
     rhs_prequantized = rhs_scales is not None
 
-    # Normalize the layout flags: None (auto/unset) means F-by-K, matching the kernel default.
-    # Doing this once lets the branches below use the simpler `not lhs_is_f_by_k` form while
-    # still treating an unset (None) flag as F-by-K rather than K-by-F.
-    lhs_is_f_by_k = lhs_is_f_by_k is not False
-    rhs_is_f_by_k = rhs_is_f_by_k is not False
-
+    # None (auto/unset) and F_BY_K both mean F-by-K (the kernel default); only an explicit
+    # K_BY_F selects the K-by-F layout. This matches TensorDescriptor's resolution and the
+    # kernel's `orientation=None if is_f_by_k else K_BY_F` mapping exactly.
     if not lhs_prequantized and not rhs_prequantized:
         # Both BF16: swizzle if needed, then quantize and matmul
         if lhs_is_swizzled:
             lhs_sw = lhs
-        elif not lhs_is_f_by_k:
+        elif lhs_orientation == TensorOrientation.K_BY_F:
             # lhs is [K, M] already (K-by-F); swizzle directly
             lhs_sw = swizzle(lhs.copy())
         else:
@@ -245,7 +245,7 @@ def matmul_mxfp8_torch_ref(
 
         if rhs_is_swizzled:
             rhs_sw = rhs
-        elif not rhs_is_f_by_k:
+        elif rhs_orientation == TensorOrientation.K_BY_F:
             # rhs is [K, N] already (K-by-F); swizzle directly
             rhs_sw = swizzle(rhs.copy())
         else:
@@ -257,7 +257,12 @@ def matmul_mxfp8_torch_ref(
         # At least one operand is pre-quantized.
         # For BF16 operands, swizzle and quantize. For pre-quantized, use directly.
         if not lhs_prequantized:
-            lhs_sw = lhs if lhs_is_swizzled else (swizzle(lhs.copy()) if not lhs_is_f_by_k else swizzle(lhs.T.copy()))
+            if lhs_is_swizzled:
+                lhs_sw = lhs
+            elif lhs_orientation == TensorOrientation.K_BY_F:
+                lhs_sw = swizzle(lhs.copy())
+            else:
+                lhs_sw = swizzle(lhs.T.copy())
             a_data, a_scale = mx_util.quantize_mx_golden(lhs_sw, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
         else:
             # Pre-quantized: data may be non-x4 dtype, view as x4
@@ -273,7 +278,12 @@ def matmul_mxfp8_torch_ref(
             a_scale = _raw_exponent_scale(a_scale)
 
         if not rhs_prequantized:
-            rhs_sw = rhs if rhs_is_swizzled else (swizzle(rhs.copy()) if not rhs_is_f_by_k else swizzle(rhs.T.copy()))
+            if rhs_is_swizzled:
+                rhs_sw = rhs
+            elif rhs_orientation == TensorOrientation.K_BY_F:
+                rhs_sw = swizzle(rhs.copy())
+            else:
+                rhs_sw = swizzle(rhs.T.copy())
             b_data, b_scale = mx_util.quantize_mx_golden(rhs_sw, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
         else:
             b_data = rhs

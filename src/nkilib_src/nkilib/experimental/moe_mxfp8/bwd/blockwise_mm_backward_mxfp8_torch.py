@@ -27,7 +27,7 @@ from ...moe.bwd.moe_bwd_parameters import (
     AffinityOption,
     SkipMode,
 )
-from ...mxfp_utils.mxfp8_utils.common_dataclasses import SwizzleMode
+from .config import MXFP8MOEBwdConfig
 
 
 def blockwise_mm_bwd_mxfp8_torch_ref(
@@ -38,51 +38,25 @@ def blockwise_mm_bwd_mxfp8_torch_ref(
     token_position_to_id: torch.Tensor,
     block_to_expert: torch.Tensor,
     output_hidden_states_grad: torch.Tensor,
-    block_size: int,
+    block_size: int = 4096,
     gate_up_proj_act_checkpoint_T: torch.Tensor = None,
     gate_act_checkpoint_T: torch.Tensor = None,
     intermediate_checkpoint_T: torch.Tensor = None,
     scaled_intermediate_checkpoint_T: torch.Tensor = None,
     down_proj_act_checkpoint=None,
+    config: MXFP8MOEBwdConfig = None,
     gate_up_weight_scales=None,
-    gate_up_weight_is_swizzled: bool = False,
     down_weight_scales=None,
-    down_weight_is_swizzled: bool = False,
-    phase1_config=None,
-    phase2_config=None,
-    phase3_config=None,
-    phase4_config=None,
-    fp8_x4_dtype=None,
-    spill_reload: bool = False,
-    use_scale_packing: bool = True,
-    run_with_lnc2: bool = True,
-    shard_option=None,
-    affinity_option=None,
-    compute_dtype=None,
-    skip_dma=None,
-    skip_grad_initialization: bool = False,
-    single_expert_dense: bool = False,
-    fast_dma_transpose: bool = False,
-    output_grad_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
-    down_weight_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
-    d_gate_up_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
-    gate_up_weight_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
-    d_gate_up_t_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
-    hidden_states_t_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
-    output_grad_t_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
-    scaled_intermediate_t_swizzle_mode: SwizzleMode = SwizzleMode.DGT,
-    accumulate_hidden_states_grad: bool = True,
-    clamp_limits=None,
-    activation_type=None,
-    bias: bool = False,
-    phase3_transpose_mode=None,
-    phase4_transpose_mode=None,
 ) -> dict:
     """PyTorch reference for ``blockwise_mm_bwd_mxfp8``.
 
-    Thin wrapper around the BF16 MoE backward golden. Hardware/quantization
-    arguments are accepted for signature compatibility but do not affect the result.
+    Thin wrapper around the BF16 MoE backward golden. The parameter set matches the
+    kernel entry exactly; only ``config``'s ``clamp_limits`` / ``bias`` /
+    ``accumulate_hidden_states_grad`` fields and the tensor inputs affect the result.
+    The remaining hardware/quantization knobs do not change the reference math.
     """
+    if config is None:
+        config = MXFP8MOEBwdConfig()
     block_to_expert_1d = block_to_expert.reshape(-1)
     return blockwise_mm_bwd_torch_ref(
         hidden_states=hidden_states,
@@ -98,7 +72,7 @@ def blockwise_mm_bwd_mxfp8_torch_ref(
         skip_dma=SkipMode(True, False),
         affinity_option=AffinityOption.AFFINITY_ON_I,
         activation_type=ActFnType.SiLU,
-        clamp_limits=clamp_limits,
-        bias=bias,
-        is_tensor_update_accumulating=accumulate_hidden_states_grad,
+        clamp_limits=config.clamp_limits,
+        bias=config.bias,
+        is_tensor_update_accumulating=config.accumulate_hidden_states_grad,
     )

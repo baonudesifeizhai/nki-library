@@ -23,11 +23,11 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...core.utils.allocator import SbufManager
-from ...core.utils.tensor_view import TensorView
+from ..mla.deepseek.mla_common_cte import RopeLayout
 from .sparse_attention_indexer_utils import CACHE_TILE, P_MAX
 
 
-def transpose_k_for_cache(sbm: SbufManager, k_bf16_sb: nl.ndarray, S: int, head_dim: int) -> nl.ndarray:
+def transpose_k_for_cache(sbm: SbufManager, k_bf16_sb: nl.NkiTensor, S: int, head_dim: int) -> nl.NkiTensor:
     """Transpose K from [S P, head_dim F] to [head_dim P, S F] via DMA.
 
     Returns the transposed SBUF tile, reused by BOTH ``persist_k_bf16``
@@ -46,8 +46,8 @@ def transpose_k_for_cache(sbm: SbufManager, k_bf16_sb: nl.ndarray, S: int, head_
 
 def persist_k_bf16(
     sbm: SbufManager,
-    k_transposed_sb: nl.ndarray,
-    k_cache: nl.ndarray,
+    k_transposed_sb: nl.NkiTensor,
+    k_cache: nl.NkiTensor,
     b_idx: int,
     cache_pos: int,
     S: int,
@@ -68,12 +68,12 @@ def persist_k_bf16(
 
 def _load_k_cache_bf16(
     sbm: SbufManager,
-    k_cache: nl.ndarray,
+    k_cache: nl.NkiTensor,
     b_idx: int,
     end_pos: int,
     head_dim: int,
-    k_full_bf16_sb: nl.ndarray,
-    k_current_T_sb: Optional[nl.ndarray] = None,
+    k_full_bf16_sb: nl.NkiTensor,
+    k_current_T_sb: Optional[nl.NkiTensor] = None,
     current_start: Optional[int] = None,
     current_size: Optional[int] = None,
 ) -> None:
@@ -121,21 +121,22 @@ def _load_k_cache_bf16(
 
 def score_against_cache_bf16(
     sbm: SbufManager,
-    q_full_hbm_view: nl.ndarray,
-    cos_sb: nl.ndarray,
-    sin_sb: nl.ndarray,
-    k_cache: nl.ndarray,
-    weights_sb: nl.ndarray,
-    score_row_sb: nl.ndarray,
+    q_full_hbm_view: nl.NkiTensor,
+    cos_sb: nl.NkiTensor,
+    sin_sb: nl.NkiTensor,
+    k_cache: nl.NkiTensor,
+    weights_sb: nl.NkiTensor,
+    score_row_sb: nl.NkiTensor,
     b_idx: int,
     S: int,
     end_pos: int,
     n_heads: int,
     head_dim: int,
     rope_head_dim: int,
-    k_current_T_sb: Optional[nl.ndarray] = None,
+    k_current_T_sb: Optional[nl.NkiTensor] = None,
     current_start: Optional[int] = None,
     current_size: Optional[int] = None,
+    rope_layout: RopeLayout = RopeLayout.HALF_SPLIT,
 ) -> None:
     """BF16 score path: no Hadamard, no MX quantization.
 
@@ -150,23 +151,27 @@ def score_against_cache_bf16(
 
     Args:
         sbm (SbufManager): SBUF stack allocator used for all scratch tiles.
-        q_full_hbm_view (nl.ndarray): [S, n_heads * head_dim], bf16 Q for the current S-tile on HBM.
-        cos_sb (nl.ndarray): [S, rope_head_dim // 2], RoPE cosine table in SBUF.
-        sin_sb (nl.ndarray): [S, rope_head_dim // 2], RoPE sine table in SBUF.
-        k_cache (nl.ndarray): [B, head_dim, max_seq_len], bf16 K cache on HBM.
-        weights_sb (nl.ndarray): [S, n_heads], per-head score weights in SBUF.
-        score_row_sb (nl.ndarray): [S, end_pos], output score accumulator in SBUF (written in place).
+        q_full_hbm_view (nl.NkiTensor): [S, n_heads * head_dim], bf16 Q for the current S-tile on HBM.
+        cos_sb (nl.NkiTensor): [S, rope_head_dim // 2], RoPE cosine table in SBUF.
+        sin_sb (nl.NkiTensor): [S, rope_head_dim // 2], RoPE sine table in SBUF.
+        k_cache (nl.NkiTensor): [B, head_dim, max_seq_len], bf16 K cache on HBM.
+        weights_sb (nl.NkiTensor): [S, n_heads], per-head score weights in SBUF.
+        score_row_sb (nl.NkiTensor): [S, end_pos], output score accumulator in SBUF (written in place).
         b_idx (int): Batch index into k_cache.
         S (int): Query sequence length of the current S-tile.
         end_pos (int): Total number of cache positions to score against (current + prior).
         n_heads (int): Number of attention heads.
         head_dim (int): Per-head dimension.
         rope_head_dim (int): Number of leading head-dim elements RoPE is applied to (0 disables RoPE).
-        k_current_T_sb (Optional[nl.ndarray]): Pre-transposed [head_dim, S] current K, forwarded to
+        k_current_T_sb (Optional[nl.NkiTensor]): Pre-transposed [head_dim, S] current K, forwarded to
             _load_k_cache_bf16 to avoid a redundant transpose. Supply together with current_start and
             current_size.
         current_start (Optional[int]): Cache offset where the current K slab starts.
         current_size (Optional[int]): Number of current-K positions.
+        rope_layout (RopeLayout): Q RoPE element pairing. ``HALF_SPLIT`` (default) matches
+            DeepSeek-V3.2's indexer; ``INTERLEAVED`` matches GLM-MoE-DSA's. Must match the K
+            side (``fused_layernorm_rope_k``) — Q and K are contracted together, so mixing the
+            two pairings silently corrupts the scores.
 
     Returns:
         None: score_row_sb is updated in place with the accumulated per-head scores.
@@ -214,11 +219,23 @@ def score_against_cache_bf16(
 
         # Batched RoPE: process all h_count heads in one op set.
         if rope_head_dim > 0:
-            q_view = TensorView(q_chunk_sb[:S, :]).reshape_dim(1, [HEAD_CHUNK, head_dim])
-            x_lo_view = q_view.slice(dim=2, start=0, end=rope_half)
-            x_hi_view = q_view.slice(dim=2, start=rope_half, end=rope_head_dim)
-            cos_bcast = TensorView(cos_sb[:S, :]).expand_dim(1).broadcast(dim=1, size=HEAD_CHUNK)
-            sin_bcast = TensorView(sin_sb[:S, :]).expand_dim(1).broadcast(dim=1, size=HEAD_CHUNK)
+            q_view = q_chunk_sb[:S, :].reshape_dim(1, [HEAD_CHUNK, head_dim])
+            if rope_layout.is_interleaved():
+                """
+                INTERLEAVED pairing: the two rotated lanes are the EVEN and ODD columns of each
+                head's rope slice, reached with a stride-2 inner access pattern instead of the
+                half-split's two contiguous halves. Free pattern
+                [[chunk_width, S], [head_dim, HEAD_CHUNK], [2, rope_half]] walks
+                (query, head, pair); offset 0/1 picks the lane. Everything below is identical,
+                so this is a re-addressing of the same 6 ops, not extra work.
+                """
+                x_lo_view = q_chunk_sb.ap(pattern=[[chunk_width, S], [head_dim, HEAD_CHUNK], [2, rope_half]], offset=0)
+                x_hi_view = q_chunk_sb.ap(pattern=[[chunk_width, S], [head_dim, HEAD_CHUNK], [2, rope_half]], offset=1)
+            else:
+                x_lo_view = q_view.slice(dim=2, start=0, end=rope_half)
+                x_hi_view = q_view.slice(dim=2, start=rope_half, end=rope_head_dim)
+            cos_bcast = cos_sb[:S, :].expand_dim(1).broadcast(dim=1, size=HEAD_CHUNK)
+            sin_bcast = sin_sb[:S, :].expand_dim(1).broadcast(dim=1, size=HEAD_CHUNK)
 
             t_lo_cos = sbm.alloc_stack((P_MAX, HEAD_CHUNK, rope_half), nl.float32)
             t_hi_cos = sbm.alloc_stack((P_MAX, HEAD_CHUNK, rope_half), nl.float32)
@@ -227,36 +244,36 @@ def score_against_cache_bf16(
 
             nisa.tensor_tensor(
                 dst=t_lo_cos[:S, :HEAD_CHUNK, :rope_half],
-                data1=x_lo_view.get_view(),
-                data2=cos_bcast.get_view(),
+                data1=x_lo_view,
+                data2=cos_bcast,
                 op=nl.multiply,
             )
             nisa.tensor_tensor(
                 dst=t_hi_cos[:S, :HEAD_CHUNK, :rope_half],
-                data1=x_hi_view.get_view(),
-                data2=cos_bcast.get_view(),
+                data1=x_hi_view,
+                data2=cos_bcast,
                 op=nl.multiply,
             )
             nisa.tensor_tensor(
                 dst=t_lo_sin[:S, :HEAD_CHUNK, :rope_half],
-                data1=x_lo_view.get_view(),
-                data2=sin_bcast.get_view(),
+                data1=x_lo_view,
+                data2=sin_bcast,
                 op=nl.multiply,
             )
             nisa.tensor_tensor(
                 dst=t_hi_sin[:S, :HEAD_CHUNK, :rope_half],
-                data1=x_hi_view.get_view(),
-                data2=sin_bcast.get_view(),
+                data1=x_hi_view,
+                data2=sin_bcast,
                 op=nl.multiply,
             )
             nisa.tensor_tensor(
-                dst=x_lo_view.get_view(),
+                dst=x_lo_view,
                 data1=t_lo_cos[:S, :HEAD_CHUNK, :rope_half],
                 data2=t_hi_sin[:S, :HEAD_CHUNK, :rope_half],
                 op=nl.subtract,
             )
             nisa.tensor_tensor(
-                dst=x_hi_view.get_view(),
+                dst=x_hi_view,
                 data1=t_lo_sin[:S, :HEAD_CHUNK, :rope_half],
                 data2=t_hi_cos[:S, :HEAD_CHUNK, :rope_half],
                 op=nl.add,
@@ -276,13 +293,13 @@ def score_against_cache_bf16(
             (P_MAX, HEAD_CHUNK, S),
             nl.bfloat16,
         )
-        q_chunk_bf16_view = TensorView(q_chunk_sb[:S, :]).reshape_dim(
+        q_chunk_bf16_view = q_chunk_sb[:S, :].reshape_dim(
             1,
             [HEAD_CHUNK, head_dim],
         )
         nisa.dma_transpose(
             dst=q_T_chunk_sb[:head_dim, :HEAD_CHUNK, :S],
-            src=q_chunk_bf16_view.get_view(),
+            src=q_chunk_bf16_view,
             axes=(2, 1, 0),
         )
 

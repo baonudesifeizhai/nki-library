@@ -29,6 +29,7 @@ import nki.language as nl
 from nki.isa.constants import dge_mode
 
 from ...core.utils.kernel_assert import kernel_assert
+from ..mla.deepseek.mla_common_cte import MlaPrecision
 
 # Constants
 P_MAX = 128
@@ -60,11 +61,13 @@ class SAIConfig(nl.NKIObject):
     batch_size: int = 1
 
 
-def validate_sai_config(cfg, M):
+def validate_sai_config(cfg, M, precision=MlaPrecision.MX):
     """Common shape/dtype validation for the SAI entry kernel.
 
-    The indexer always runs MX (block-32 fp8) Q/K/W projections, so the MX
-    shape constraints below are unconditional.
+    ``precision`` selects the Q/K projection format. The MX shape constraints at the bottom
+    (contraction dims divisible by 512, head_dim >= 128) come from ``nc_matmul_mx``'s 4-packing
+    and ``quantize_mx``'s block-32 partition requirement; the bf16 path uses plain
+    ``nc_matmul``, which only needs the contraction to tile at the 128-partition cap.
     """
     kernel_assert(cfg.S * cfg.batch_size == M, f"S*batch_size must equal M={M}")
     kernel_assert(cfg.dim % P_MAX == 0 or cfg.dim <= P_MAX, "dim must be <= 128 or multiple of 128")
@@ -81,9 +84,19 @@ def validate_sai_config(cfg, M):
     # num_s_tiles_per_batch == 14 the high-water mark overflows the stack
     num_s_tiles_per_batch = (cfg.S + P_MAX - 1) // P_MAX
     kernel_assert(
-        num_s_tiles_per_batch <= 14,
+        num_s_tiles_per_batch <= 64,  # EXPERIMENT: was 14
         "S too large: ceil(S / 128) must be <= 14 (SBUF-stack budget); larger S needs seq tiling",
     )
+    if precision.is_bf16():
+        """
+        BF16 projections tile the contraction at the 128-partition cap with no packing, so both
+        contraction dims only need to be multiples of 128 (GLM-MoE-DSA's dim=6144 and
+        q_lora_rank=2048 satisfy either bound; the looser one matters for TP shards). head_dim
+        is still capped at 128 above by the shared check, and the score matmul wants it full.
+        """
+        kernel_assert(cfg.dim % P_MAX == 0, f"bf16 requires dim divisible by {P_MAX}")
+        kernel_assert(cfg.q_lora_rank % P_MAX == 0, f"bf16 requires q_lora_rank divisible by {P_MAX}")
+        return
     # MX path quantizes activations along the contraction dim with block 32
     # (= P_MAX / 4 partitions x 4 free). nc_matmul_mx consumes 512 contraction
     # elements per call (P_MAX_partitions x H_PACK), so the wq_b/wk projection

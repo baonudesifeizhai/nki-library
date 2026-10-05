@@ -135,8 +135,7 @@ from typing import Any, List, Optional
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import engine, reduce_cmd
-from nki.language.opcode import maximum as _maximum
+import nki.language.opcode as _nl_opcode
 
 from ..utils.allocator import align_to
 from ..utils.interleave_copy import interleave_copy
@@ -2974,11 +2973,11 @@ class KTileInfo(nl.NKIObject):
     seqlen_k: int  # region length (prior or active)
     k_start_pos: int  # region-local start of the tile
     unmasked: bool  # tile has unmasked, in-range keys
+    num_valid_k: int = 0  # valid keys from the tile start to the region end
 
-    @property
-    def num_valid_k(self) -> int:
-        """Valid keys from the tile start to the region end."""
-        return self.seqlen_k - self.k_start_pos
+    def __post_init__(self):
+        # Field, not @property: NKI eager/nki_hop lowering does not fold property getters.
+        self.num_valid_k = self.seqlen_k - self.k_start_pos
 
 
 def _classify_and_mask_tile(grp, seqlen_offset, tile_sz, ac: AttnConfig, atp: AttnTileParams):
@@ -3117,7 +3116,7 @@ def _exp_impl(
                 op=nl.exp,
                 data=bufs.mm1_masked[grp_i][large_tile_idx][:num_p, nl.ds(exp_tile_idx * atp.exp_inst_elems, num_f)],
                 reduce_op=nl.add,
-                reduce_cmd=reduce_cmd.reset_reduce if is_first_exp else reduce_cmd.reduce,
+                reduce_cmd=nisa.reduce_cmd.reset_reduce if is_first_exp else nisa.reduce_cmd.reduce,
                 reduce_res=(
                     bufs.exp_partial_sum[grp_i][
                         :num_p,
@@ -3452,7 +3451,7 @@ def _scale_reciprocal_write_back_impl(
                 src_buf[:num_p, :d],
                 nl.multiply,
                 bufs.exp_sum_reciprocal[:num_p, grp_i],
-                engine=engine.vector,
+                engine=nisa.engine.vector,
             )
 
     _write_back_o_impl(bufs.mm2_final[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
@@ -3766,7 +3765,7 @@ def _qk_and_max_large_tile_impl(
         # out only on the last; when not chaining, every tile resets and reads out (per-tile reduce).
         chaining = row_max_first_tile is not None
         row_max_reduce_cmd = (
-            reduce_cmd.reduce if (chaining and k_tile_idx != row_max_first_tile) else reduce_cmd.reset_reduce
+            nisa.reduce_cmd.reduce if (chaining and k_tile_idx != row_max_first_tile) else nisa.reduce_cmd.reset_reduce
         )
         row_max_reduce_res = (
             None
@@ -3895,7 +3894,7 @@ def _qk_and_max_large_tile_impl(
                     comp_op1=comp_op1,
                     bound0=bound0[:num_p, :1],
                     bound1=bound1[:num_p, :1],
-                    reduce_op=_maximum,
+                    reduce_op=_nl_opcode.maximum,
                     reduce_res=row_max_reduce_res,
                     reduce_cmd=row_max_reduce_cmd,
                     range_start=tile.k_start_pos,
@@ -3913,7 +3912,7 @@ def _qk_and_max_large_tile_impl(
                     comp_op1=comp_op1,
                     bound0=bound0[:num_p, :1],
                     bound1=bound1[:num_p, :1],
-                    reduce_op=_maximum,
+                    reduce_op=_nl_opcode.maximum,
                     reduce_res=row_max_reduce_res,
                     reduce_cmd=row_max_reduce_cmd,
                     range_start=tile.k_start_pos,
@@ -3931,7 +3930,7 @@ def _qk_and_max_large_tile_impl(
                     comp_op1=comp_op1,
                     bound0=bound0[:num_p, :1],
                     bound1=bound1[:num_p, :1],
-                    reduce_op=_maximum,
+                    reduce_op=_nl_opcode.maximum,
                     reduce_res=row_max_reduce_res,
                     reduce_cmd=row_max_reduce_cmd,
                     range_start=tile.k_start_pos,

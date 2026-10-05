@@ -31,10 +31,10 @@ from .matmul_mxfp8_config import MatmulMxfp8KernelConfig
 
 
 def spill_block(
-    quantized_data_hbm: nl.ndarray,
-    quantized_scales_hbm: nl.ndarray,
-    quantized_data_sbuf: nl.ndarray,
-    quantized_scales_sbuf: nl.ndarray,
+    quantized_data_hbm: nl.NkiTensor,
+    quantized_scales_hbm: nl.NkiTensor,
+    quantized_data_sbuf: nl.NkiTensor,
+    quantized_scales_sbuf: nl.NkiTensor,
     block_idx_k: int,
     block_idx_f: int,
     BLOCK_K_PHYSICAL: int,
@@ -54,11 +54,11 @@ def spill_block(
         F_x4: F dimension in x4 packed elements.
 
     Args:
-        quantized_data_hbm (nl.ndarray): Quantized data in HBM (x4 format).
-        quantized_scales_hbm (nl.ndarray): Quantized scales in HBM.
-        quantized_data_sbuf (nl.ndarray): Quantized data in SBUF (x4 format),
+        quantized_data_hbm (nl.NkiTensor): Quantized data in HBM (x4 format).
+        quantized_scales_hbm (nl.NkiTensor): Quantized scales in HBM.
+        quantized_data_sbuf (nl.NkiTensor): Quantized data in SBUF (x4 format),
             shape (TILE_K, NUM_TILES_K, F_x4).
-        quantized_scales_sbuf (nl.ndarray): Scales in SBUF,
+        quantized_scales_sbuf (nl.NkiTensor): Scales in SBUF,
             shape (TILE_K, NUM_TILES_K, F_x4).
         block_idx_k (int): K block index (determines row position in spill buffer).
         block_idx_f (int): M or N block index (determines column position).
@@ -190,8 +190,8 @@ def _compute_spill_reload_tile_shapes(
 
 
 def _store_output_block_to_hbm(
-    output_sbuf: nl.ndarray,
-    output_tensor_hbm: nl.ndarray,
+    output_sbuf: nl.NkiTensor,
+    output_tensor_hbm: nl.NkiTensor,
     block_idx_m: int,
     block_idx_n: int,
     bd: BlockDescriptor,
@@ -228,7 +228,7 @@ def extract_from_sbuf_td(sbuf_td: TensorDescriptor) -> tuple:
 
 
 def _quantize_and_spill_operand(
-    loaded: nl.ndarray,
+    loaded: nl.NkiTensor,
     quantize_tile_shape: tuple,
     float8_dtype: str,
     use_scale_packing: bool,
@@ -310,6 +310,7 @@ def generic_matmul_mxfp8_api(
     # --- Tile Loading Config --- #
     TILES_IN_LOAD_M: int = None,
     TILES_IN_LOAD_N: int = None,
+    TILES_IN_LOAD_K: int = None,
     # --- Block Location --- #
     block_idx_m: Optional[Tuple[int, int]] = None,
     block_idx_n: Optional[Tuple[int, int]] = None,
@@ -336,6 +337,9 @@ def generic_matmul_mxfp8_api(
     # --- LNC2 offset --- #
     rhs_n_offset: int = 0,
     lhs_m_offset: int = 0,
+    # --- K-dimension slice offset --- #
+    rhs_k_offset: int = 0,
+    lhs_k_offset: int = 0,
     # --- Accumulation control --- #
     initialize_accumulator: bool = True,
 ) -> None:
@@ -391,6 +395,9 @@ def generic_matmul_mxfp8_api(
             (already swizzled and quantized).
         rhs_n_offset: Additional N offset for RHS (used for LNC2 N-sharding).
         lhs_m_offset: Additional M offset for LHS (used for LNC2 M-sharding).
+        rhs_k_offset: Additive K-start offset (logical-K units, K-axis analog of rhs_n_offset)
+            picking a K-window of a wider RHS operand; window length is the TD's effective_k_dim.
+        lhs_k_offset: Symmetric K-window offset for the LHS. Default 0.
         initialize_accumulator: If True (default), the first K-block zeroes the SBUF
             accumulator before writing. If False, all K-blocks accumulate (+=) into
             the existing SBUF contents. Set to False when multiple API calls must
@@ -419,6 +426,7 @@ def generic_matmul_mxfp8_api(
         output_dtype = output_dtype if output_dtype != nl.float32 else (config.output_dtype or nl.float32)
         TILES_IN_LOAD_M = TILES_IN_LOAD_M or config.TILES_IN_LOAD_M
         TILES_IN_LOAD_N = TILES_IN_LOAD_N or config.TILES_IN_LOAD_N
+        TILES_IN_LOAD_K = TILES_IN_LOAD_K or config.TILES_IN_LOAD_K
         lhs_matmul_tile_shape_physical = lhs_matmul_tile_shape_physical or config.lhs_matmul_tile_shape_physical
         rhs_matmul_tile_shape_physical = rhs_matmul_tile_shape_physical or config.rhs_matmul_tile_shape_physical
         lhs_load_tile_shape = lhs_load_tile_shape or config.lhs_load_tile_shape
@@ -458,6 +466,30 @@ def generic_matmul_mxfp8_api(
     _, M_LOGICAL = lhs_hbm_td.sharded_logical_shape
     _, N_LOGICAL = rhs_hbm_td.sharded_logical_shape
     K_LOGICAL = lhs_hbm_td.logical_shape[0]
+
+    # A K-slice reads a contraction window (length effective_k_dim, start rhs/lhs_k_offset)
+    # of a wider operand; guard it matches the matmul K and stays in bounds.
+    kernel_assert(rhs_k_offset >= 0 and lhs_k_offset >= 0, "k_offset must be non-negative")
+    if rhs_hbm_td.effective_k_dim is not None:
+        kernel_assert(
+            rhs_hbm_td.effective_k_dim == K_LOGICAL,
+            f"rhs effective_k_dim ({rhs_hbm_td.effective_k_dim}) must equal contraction K ({K_LOGICAL})",
+        )
+        kernel_assert(
+            rhs_k_offset + rhs_hbm_td.effective_k_dim <= rhs_hbm_td.logical_shape[0],
+            f"rhs K-slice [{rhs_k_offset}, {rhs_k_offset + rhs_hbm_td.effective_k_dim}) exceeds "
+            f"RHS K ({rhs_hbm_td.logical_shape[0]})",
+        )
+    if lhs_hbm_td.effective_k_dim is not None:
+        kernel_assert(
+            lhs_hbm_td.effective_k_dim == K_LOGICAL,
+            f"lhs effective_k_dim ({lhs_hbm_td.effective_k_dim}) must equal contraction K ({K_LOGICAL})",
+        )
+        kernel_assert(
+            lhs_k_offset + lhs_hbm_td.effective_k_dim <= lhs_hbm_td.logical_shape[0],
+            f"lhs K-slice [{lhs_k_offset}, {lhs_k_offset + lhs_hbm_td.effective_k_dim}) exceeds "
+            f"LHS K ({lhs_hbm_td.logical_shape[0]})",
+        )
 
     # Default load tile counts
     if TILES_IN_LOAD_M == None:
@@ -551,12 +583,15 @@ def generic_matmul_mxfp8_api(
                         rhs_td=load_rhs_td,
                         TILES_IN_LOAD_M=TILES_IN_LOAD_M,
                         TILES_IN_LOAD_N=TILES_IN_LOAD_N,
+                        TILES_IN_LOAD_K=TILES_IN_LOAD_K,
                         lhs_load_tile_shape=lhs_load_tile_shape if lhs_load_from_hbm else lhsq_load_tile_shape,
                         rhs_load_tile_shape=rhs_load_tile_shape if rhs_load_from_hbm else rhsq_load_tile_shape,
                         block_idx=(idx_m, idx_k, idx_n),
                         bd=spill_reload_bd,
                         rhs_n_offset=rhs_n_offset if rhs_load_from_hbm else 0,
                         lhs_m_offset=lhs_m_offset if lhs_load_from_hbm else 0,
+                        rhs_k_offset=rhs_k_offset if rhs_load_from_hbm else 0,
+                        lhs_k_offset=lhs_k_offset if lhs_load_from_hbm else 0,
                     )
 
                 if lhs_sbuf_has_data:

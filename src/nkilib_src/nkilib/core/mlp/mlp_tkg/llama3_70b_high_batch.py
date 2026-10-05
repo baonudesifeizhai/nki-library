@@ -22,10 +22,11 @@ I/2 weight slice (HALF the per-core weight DMA), computes a PARTIAL down output,
 and a single cross-core reduce-scatter recombines the two partials.
 
 Activation FP8 quant matches the golden's STATIC-quant contract for this config:
-the gate/up input uses a dynamic per-token amax scale (which never saturates
-here, so it equals the golden up to fp8 rounding), while the down input uses the
-PROVIDED static down_in_scale with a +/-FP8_MAX clamp (the intermediate saturates
-hard against that tiny scale, so a dynamic scale would diverge from the golden).
+both the gate/up input and the down input quantize with the PROVIDED static
+scales (gate_up_in_scale, down_in_scale) plus a +/-FP8_MAX clamp. A dynamic
+per-token amax scale cannot clamp by construction, so it would compute a
+different function than the reference (the intermediate in particular saturates
+hard against the tiny static down scale).
 """
 
 from typing import Optional
@@ -41,7 +42,6 @@ from ...utils.kernel_helpers import (
     get_nl_act_fn_from_type,
     get_program_sharding_info,
 )
-from ...utils.tensor_view import TensorView
 from ..mlp_parameters import MLPParameters
 
 _PMAX = 128
@@ -105,7 +105,7 @@ def _mlp_tkg_ishard(params, output_tensor_hbm, T, H, I, H0, H1, n_prgs, prg_id, 
     nisa.reciprocal(dst=uscale_din[0:_PMAX, 0:1], data=din_scale[0:_PMAX, 0:1])
     nisa.tensor_tensor(uscale_din[0:_PMAX, 0:1], uscale_din[0:_PMAX, 0:1], uscale[0:_PMAX, 0:1], nl.multiply)
 
-    # per-token, per-token-block activation dequant scales (gate/up: dynamic amax)
+    # per-token-block activation dequant scales (gate/up: static per-tensor scale)
     gate_in_scale = nl.ndarray((_PMAX, TB), dtype=nl.float32, buffer=nl.sbuf)
     combined_g = nl.ndarray((_PMAX, TB), dtype=nl.float32, buffer=nl.sbuf)
     combined_u = nl.ndarray((_PMAX, TB), dtype=nl.float32, buffer=nl.sbuf)
@@ -203,8 +203,8 @@ def _mlp_tkg_ishard(params, output_tensor_hbm, T, H, I, H0, H1, n_prgs, prg_id, 
         absh = nl.ndarray((_PMAX, H), dtype=nl.float32, buffer=nl.sbuf)
         if do_norm:
             w = nl.ndarray((_PMAX, H), dtype=nl.float32, buffer=nl.sbuf)
-            # Chunk-pipeline the gamma-multiply (Vector) and abs/amax (Scalar) so
-            # they overlap, collapsing two serial full-H passes into ~one.
+            # Chunked to keep the diff minimal; the abs/amax reduce below runs on
+            # Vector too, so the split no longer overlaps two engines.
             NCH = 8
             CW = H // NCH
             amax_parts = nl.ndarray((_PMAX, NCH), dtype=nl.float32, buffer=nl.sbuf)
@@ -214,31 +214,37 @@ def _mlp_tkg_ishard(params, output_tensor_hbm, T, H, I, H0, H1, n_prgs, prg_id, 
                 nisa.tensor_tensor(
                     w[0:t_sz, cs:ce], ht[0:t_sz, cs:ce], gamma_f[0:t_sz, cs:ce], nl.multiply, engine=nisa.engine.vector
                 )
-                nisa.activation(
-                    absh[0:t_sz, cs:ce],
-                    op=nl.abs,
+                # Vector-engine abs + max reduce. The Scalar Engine's reduce
+                # accumulator can only sum on NeuronCore-v3 (its Activate
+                # instruction encodes no accumulator operator), so a fused max
+                # there is not expressible; tensor_scalar_reduce does it on the
+                # engine whose reduction supports maximum.
+                nisa.tensor_scalar_reduce(
+                    dst=absh[0:t_sz, cs:ce],
                     data=w[0:t_sz, cs:ce],
-                    reduce_op=nl.max,
+                    op0=nl.abs,
+                    operand0=0.0,
+                    reduce_op=nl.maximum,
                     reduce_res=amax_parts[0:t_sz, c : c + 1],
-                    reduce_cmd=nisa.reduce_cmd.reset_reduce,
                 )
             nisa.tensor_reduce(amax[0:t_sz, 0:1], op=nl.max, data=amax_parts[0:t_sz, 0:NCH], axis=1, keepdims=True)
             src_tile = w
         else:
-            # per-token fp8 quant of hidden tile (amax over the tile)
-            nisa.activation(
-                absh[0:t_sz, 0:H],
-                op=nl.abs,
+            # per-token fp8 quant of hidden tile (amax over the tile); Vector-engine
+            # abs + max reduce, see the reduce note in the do_norm branch above.
+            nisa.tensor_scalar_reduce(
+                dst=absh[0:t_sz, 0:H],
                 data=ht[0:t_sz, 0:H],
-                reduce_op=nl.max,
+                op0=nl.abs,
+                operand0=0.0,
+                reduce_op=nl.maximum,
                 reduce_res=amax[0:t_sz, 0:1],
-                reduce_cmd=nisa.reduce_cmd.reset_reduce,
             )
             src_tile = ht
 
         # NOTE: amax is dead once the static scale replaced it as the quant
-        # multiplier. Left in place here rather than removed in a correctness fix;
-        # a follow-up should drop it and the abs/reduce work that feeds it.
+        # multiplier. Kept here to bound this fix to the illegal reduce; a
+        # follow-up should drop amax and the abs/reduce work that feeds it.
         nisa.tensor_scalar(dst=amax[0:t_sz, 0:1], data=amax[0:t_sz, 0:1], op0=nl.add, operand0=1e-12)
         # quant multiplier = 1/gate_up_in_scale, times the RMS reciprocal when the
         # norm is fused in.
@@ -298,15 +304,8 @@ def _mlp_tkg_ishard(params, output_tensor_hbm, T, H, I, H0, H1, n_prgs, prg_id, 
 
     # Pack the per-token hidden quant scale (fp32) into the extra plane so it rides
     # with the transposed hidden in one sendrecv (4 fp8 cols reinterpreted as 1 fp32).
-    my_scale_slot = (
-        TensorView(hidden_sb)
-        .slice(1, my_b, my_b + 1)
-        .slice(2, H1, H1 + 1)
-        .slice(3, 0, 4)
-        .reinterpret_cast(nl.float32)
-        .get_view()
-    )
-    my_scale_src = TensorView(gate_in_scale).slice(1, my_b, my_b + 1).reshape_dim(1, (1, 1, 1)).get_view()
+    my_scale_slot = hidden_sb.slice(1, my_b, my_b + 1).slice(2, H1, H1 + 1).slice(3, 0, 4).view(nl.float32)
+    my_scale_src = gate_in_scale.slice(1, my_b, my_b + 1).reshape_dim(1, (1, 1, 1))
     nisa.tensor_copy(dst=my_scale_slot, src=my_scale_src)
 
     # exchange transposed hidden slice + packed hidden quant scale in ONE sendrecv
@@ -318,15 +317,8 @@ def _mlp_tkg_ishard(params, output_tensor_hbm, T, H, I, H0, H1, n_prgs, prg_id, 
         pipe_id=1,
     )
     # unpack the received scale back into gate_in_scale[:, other_b]
-    other_scale_slot = (
-        TensorView(hidden_sb)
-        .slice(1, other_b, other_b + 1)
-        .slice(2, H1, H1 + 1)
-        .slice(3, 0, 4)
-        .reinterpret_cast(nl.float32)
-        .get_view()
-    )
-    other_scale_dst = TensorView(gate_in_scale).slice(1, other_b, other_b + 1).reshape_dim(1, (1, 1, 1)).get_view()
+    other_scale_slot = hidden_sb.slice(1, other_b, other_b + 1).slice(2, H1, H1 + 1).slice(3, 0, 4).view(nl.float32)
+    other_scale_dst = gate_in_scale.slice(1, other_b, other_b + 1).reshape_dim(1, (1, 1, 1))
     nisa.tensor_copy(dst=other_scale_dst, src=other_scale_slot)
     # recompute combined gate/up dequant scales for the received (other) block
     nisa.tensor_tensor(

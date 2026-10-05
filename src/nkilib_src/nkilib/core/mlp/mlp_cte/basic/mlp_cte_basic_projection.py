@@ -234,8 +234,8 @@ def _perform_doublerow_down_projection(
     current_bxs_tile = bxs_tiles[indices.bxs_tile_idx]
 
     hidden_tiles = TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size)
-    int_doublerow_tile_size = 2 * int_dim_tile.tile_size
-    int_doublerow_tiles = TiledRange(mlp_params.intermediate_size, int_doublerow_tile_size)
+
+    int_doublerow_tiles = TiledRange(mlp_params.intermediate_size, 2 * I_TILE_SIZE)
 
     if mlp_params.quant_params.is_quant_row():
         weight_row_scales_sbuf_list = []
@@ -272,8 +272,13 @@ def _perform_doublerow_down_projection(
             )
 
         for int_doublerow_tile in int_doublerow_tiles:
+            # The intermediate transpose lays each tile out as two equally sized column blocks,
+            # except a trailing tile of at most I_TILE_SIZE rows which stays a single block. As
+            # double_row needs two equally sized row groups, it applies exactly when the tile spans
+            # two blocks.
             perform_doublerow_matmul = int_doublerow_tile.size > I_TILE_SIZE
-            single_int_tile_size = int_doublerow_tile.size // 2
+            int_group_count = 2 if perform_doublerow_matmul else 1
+            int_group_size = int_doublerow_tile.size // int_group_count
 
             weights_buffer_idx = (
                 hidden_tile.index * len(int_doublerow_tiles) + int_doublerow_tile.index
@@ -281,28 +286,20 @@ def _perform_doublerow_down_projection(
 
             weights_sbuf_view = weights_sbuf_list[weights_buffer_idx].reshape((int_dim_tile.tile_size, 2, H_TILE_SIZE))
 
-            in_load_pattern = (
-                [
-                    [mlp_params.hidden_size, single_int_tile_size],
-                    [single_int_tile_size * mlp_params.hidden_size, 2],
-                    [1, hidden_tile.size],
-                ]
-                if perform_doublerow_matmul
-                else [
-                    [mlp_params.hidden_size, int_doublerow_tile.size],
-                    [int_doublerow_tile.size * mlp_params.hidden_size, 1],
-                    [1, hidden_tile.size],
-                ]
-            )
+            in_load_pattern = [
+                [mlp_params.hidden_size, int_group_size],
+                [int_group_size * mlp_params.hidden_size, int_group_count],
+                [1, hidden_tile.size],
+            ]
             in_load_offset = (
-                int_doublerow_tile.index * int_doublerow_tile_size + I_SHARD_OFFSET
+                int_doublerow_tile.start_offset + I_SHARD_OFFSET
             ) * mlp_params.hidden_size + hidden_tile.index * H_TILE_SIZE
 
-            out_load_pattern = (
-                [[2 * H_TILE_SIZE, single_int_tile_size], [H_TILE_SIZE, 2], [1, hidden_tile.size]]
-                if perform_doublerow_matmul
-                else [[2 * H_TILE_SIZE, int_doublerow_tile.size], [H_TILE_SIZE, 1], [1, hidden_tile.size]]
-            )
+            out_load_pattern = [
+                [2 * H_TILE_SIZE, int_group_size],
+                [H_TILE_SIZE, int_group_count],
+                [1, hidden_tile.size],
+            ]
 
             nisa.dma_copy(
                 src=weights_tensor_hbm.ap(
@@ -324,17 +321,17 @@ def _perform_doublerow_down_projection(
                 )
 
                 st_pattern = (
-                    [[ROUNDED_INT_DIM, single_int_tile_size], [BXS_SUBTILE_SIZE, 2], [1, bxs_subtile.size]]
+                    [[ROUNDED_INT_DIM, int_group_size], [BXS_SUBTILE_SIZE, int_group_count], [1, bxs_subtile.size]]
                     if perform_doublerow_matmul
-                    else [[ROUNDED_INT_DIM, int_doublerow_tile.size], [1, bxs_subtile.size]]
+                    else [[ROUNDED_INT_DIM, int_group_size], [1, bxs_subtile.size]]
                 )
                 st_offset = int_doublerow_tile.index * 2 * BXS_SUBTILE_SIZE
                 intermediate_mm_in = source_tile_sbuf_view.ap(pattern=st_pattern, offset=st_offset)
 
                 mv_pattern = (
-                    [[2 * H_TILE_SIZE, single_int_tile_size], [H_TILE_SIZE, 2], [1, hidden_tile.size]]
+                    [[2 * H_TILE_SIZE, int_group_size], [H_TILE_SIZE, int_group_count], [1, hidden_tile.size]]
                     if perform_doublerow_matmul
-                    else [[2 * H_TILE_SIZE, int_doublerow_tile.size], [1, hidden_tile.size]]
+                    else [[2 * H_TILE_SIZE, int_group_size], [1, hidden_tile.size]]
                 )
                 weights_mm_in = weights_sbuf_view.ap(pattern=mv_pattern, offset=0)
 

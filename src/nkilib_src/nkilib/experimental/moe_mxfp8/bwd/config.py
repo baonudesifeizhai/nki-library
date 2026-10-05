@@ -14,7 +14,7 @@
 
 """Configuration for the MXFP8 MoE backward kernel."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 import nki
@@ -53,6 +53,8 @@ def _default_matmul_config():
         TILES_IN_BLOCK_N=1,
         TILES_IN_BLOCK_K=1,
         quant_scheme=QuantScheme.WRAPX,
+        spill_reload=True,
+        enable_scale_packing=True,
     )
 
 
@@ -67,19 +69,30 @@ class MXFP8MOEBwdConfig(nl.NKIObject):
         fp8_x4_dtype (type): MXFP8 packed data type (default: float8_e4m3fn_x4).
         activation_type (ActFnType): Activation function type (default: SiLU).
         shard_option (ShardOption): LNC2 sharding strategy (default: SHARD_ON_FREE).
-        affinity_option (AffinityOption): Affinity scaling dimension (default: AFFINITY_ON_H).
+        affinity_option (AffinityOption): Affinity scaling dimension (default: AFFINITY_ON_I,
+            the only mode the MXFP8 backward implements).
         phase1_config (MatmulMxfp8KernelConfig): Matmul config for Phase 1 (gate_up_proj_output_grad + SwiGLU bwd + ea grad).
         phase2_config (MatmulMxfp8KernelConfig): Matmul config for Phase 2 (hidden_states_grad).
         phase3_config (MatmulMxfp8KernelConfig): Matmul config for Phase 3 (gate_up_weight_grad).
         phase4_config (MatmulMxfp8KernelConfig): Matmul config for Phase 4 (down_weight_grad).
         accumulate_hidden_states_grad (bool): Whether Phase 2 accumulates into
-            existing hidden-state gradients.
+            existing hidden-state gradients. Defaults False to match the
+            single_expert_dense default, which requires it off.
         skip_grad_initialization (bool): Whether to skip zeroing gradient outputs.
-        single_expert_dense (bool): Whether inputs are packed contiguously for one expert.
+        single_expert_dense (bool): Whether inputs are packed contiguously for one
+            expert (default True). Routed (E > 1) callers must set this False.
         fast_dma_transpose (bool): Whether unswizzled BF16 matmul operands use direct DGT addressing.
+        pe_transpose_only (bool): Whether dense execution materializes Phase 3/4
+            F-by-K operands and loads checkpoints with PE transposes only.
         clamp_limits (ClampLimits): Optional gradient clamping limits.
         skip_dma (SkipMode): OOB handling mode for DMA operations.
         bias (bool): Whether to compute bias gradients.
+        output_grad_swizzle_mode..scaled_intermediate_t_swizzle_mode (SwizzleMode): The
+            tensor-local DGT/PE conversion mode for each matmul operand descriptor
+            (default SwizzleMode.PE).
+
+    Spill/reload and scale packing are per-phase: set them on the phase configs
+    (``spill_reload`` / ``enable_scale_packing`` on MatmulMxfp8KernelConfig).
     """
 
     # Compute settings
@@ -87,26 +100,30 @@ class MXFP8MOEBwdConfig(nl.NKIObject):
     fp8_x4_dtype: type = float8_e4m3fn_x4
     activation_type: ActFnType = ActFnType.SiLU
 
-    # Sharding & affinity
+    # AFFINITY_ON_I is the only mode the backward implements, so it is the default.
     shard_option: ShardOption = ShardOption.SHARD_ON_FREE
-    affinity_option: AffinityOption = AffinityOption.AFFINITY_ON_H
+    affinity_option: AffinityOption = AffinityOption.AFFINITY_ON_I
 
-    # Per-phase matmul configs default to one tile per block. The kernel fills
+    # None => __post_init__ builds a one-tile-per-block default. The kernel fills the
     # shape-dependent fields after input validation.
-    phase1_config: MatmulMxfp8KernelConfig = field(default_factory=_default_matmul_config)
-    phase2_config: MatmulMxfp8KernelConfig = field(default_factory=_default_matmul_config)
-    phase3_config: MatmulMxfp8KernelConfig = field(default_factory=_default_matmul_config)
-    phase4_config: MatmulMxfp8KernelConfig = field(default_factory=_default_matmul_config)
+    phase1_config: MatmulMxfp8KernelConfig = None
+    phase2_config: MatmulMxfp8KernelConfig = None
+    phase3_config: MatmulMxfp8KernelConfig = None
+    phase4_config: MatmulMxfp8KernelConfig = None
 
     # Accumulation
-    accumulate_hidden_states_grad: bool = True
+    accumulate_hidden_states_grad: bool = False
     skip_grad_initialization: bool = False
 
     # Single-expert inputs packed in block order. Routing tensors are not read.
-    single_expert_dense: bool = False
+    single_expert_dense: bool = True
 
     # Direct 4D DMA gather-transpose for unswizzled BF16 matmul operands.
     fast_dma_transpose: bool = False
+
+    # Keep transpose work on PE. Phase 3/4 use materialized F-by-K operands,
+    # and Phase 1 checkpoint tiles use dma_copy followed by nc_transpose.
+    pe_transpose_only: bool = False
 
     # Gradient clamping
     clamp_limits: ClampLimits = None
@@ -117,15 +134,25 @@ class MXFP8MOEBwdConfig(nl.NKIObject):
     # Bias
     bias: bool = False
 
-    # Per-phase transpose mechanism for BUILDING an [F,B] transpose buffer on the DGT path
-    # (TransposeMode.{NC,DMA}). NC = nc_transpose on PE (original); DMA = dma_transpose on the
-    # DMA engine (no PE cycles, no PSUM). Only P3 (hidden_states_T) and P4 (output_grad_T,
-    # scaled_intermediate_T) build transposed operands.
+    # Engine that builds the [F,B] transpose buffer on the DGT path: NC = nc_transpose on
+    # the PE, DMA = dma_transpose (no PE cycles, no PSUM). Only P3/P4 transpose operands.
     phase3_transpose_mode: TransposeMode = TransposeMode.NC
     phase4_transpose_mode: TransposeMode = TransposeMode.NC
 
+    # Per-operand tensor-local matmul layout conversion mode (DGT or PE).
+    # TODO: support PE for the two weight modes with E > 1 (only E == 1 works today).
+    output_grad_swizzle_mode: SwizzleMode = SwizzleMode.PE
+    down_weight_swizzle_mode: SwizzleMode = SwizzleMode.PE
+    d_gate_up_swizzle_mode: SwizzleMode = SwizzleMode.PE
+    gate_up_weight_swizzle_mode: SwizzleMode = SwizzleMode.PE
+    d_gate_up_t_swizzle_mode: SwizzleMode = SwizzleMode.PE
+    hidden_states_t_swizzle_mode: SwizzleMode = SwizzleMode.PE
+    output_grad_t_swizzle_mode: SwizzleMode = SwizzleMode.PE
+    scaled_intermediate_t_swizzle_mode: SwizzleMode = SwizzleMode.PE
+
     def __post_init__(self):
         """Validate typed fields and initialize optional values."""
+        quant_scheme = None
         for name in ("phase1_config", "phase2_config", "phase3_config", "phase4_config"):
             phase_config = getattr(self, name)
             if phase_config is None:
@@ -135,9 +162,25 @@ class MXFP8MOEBwdConfig(nl.NKIObject):
                 raise TypeError(f"{name} must be a MatmulMxfp8KernelConfig")
             if not isinstance(phase_config.quant_scheme, QuantScheme):
                 raise TypeError(f"{name}.quant_scheme must be a QuantScheme")
+            if quant_scheme is None:
+                quant_scheme = phase_config.quant_scheme
+            elif phase_config.quant_scheme != quant_scheme:
+                raise ValueError("All MXFP8 MoE backward phases must use the same quantization scheme")
         if not isinstance(self.phase3_transpose_mode, TransposeMode):
             raise TypeError("phase3_transpose_mode must be a TransposeMode")
         if not isinstance(self.phase4_transpose_mode, TransposeMode):
             raise TypeError("phase4_transpose_mode must be a TransposeMode")
+        for mode_name in (
+            "output_grad_swizzle_mode",
+            "down_weight_swizzle_mode",
+            "d_gate_up_swizzle_mode",
+            "gate_up_weight_swizzle_mode",
+            "d_gate_up_t_swizzle_mode",
+            "hidden_states_t_swizzle_mode",
+            "output_grad_t_swizzle_mode",
+            "scaled_intermediate_t_swizzle_mode",
+        ):
+            if getattr(self, mode_name) not in (SwizzleMode.DGT, SwizzleMode.PE):
+                raise ValueError(f"Unsupported {mode_name}: {getattr(self, mode_name)}")
         if self.clamp_limits == None:
             self.clamp_limits = ClampLimits()

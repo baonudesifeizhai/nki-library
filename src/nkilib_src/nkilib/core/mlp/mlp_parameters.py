@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Parameter dataclasses, supported-dtype definitions, and argument validation for the MLP kernel."""
 
 import math
 from dataclasses import dataclass
@@ -20,7 +21,6 @@ from typing import Optional
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
-from nki.language import NKIObject
 
 # common utils
 from ..utils.common_types import (
@@ -103,7 +103,7 @@ _Q_HEIGHT = 8  # Quantization height (elements per quantization group on partiti
 # ****************************
 #
 @dataclass
-class MLPQuantizationParameters(NKIObject):
+class MLPQuantizationParameters(nl.NKIObject):
     quantization_type: QuantizationType
     gate_w_scale: Optional[nl.NkiTensor]
     up_w_scale: Optional[nl.NkiTensor]
@@ -319,7 +319,7 @@ class MLPQuantizationParameters(NKIObject):
 
 
 @dataclass
-class MLPFusedAddParameters(NKIObject):
+class MLPFusedAddParameters(nl.NKIObject):
     fused_add_tensor: Optional[nl.NkiTensor]
     store_fused_add_result: bool
 
@@ -344,7 +344,7 @@ class MLPFusedAddParameters(NKIObject):
 
 
 @dataclass
-class MLPNormalizationParameters(NKIObject):
+class MLPNormalizationParameters(nl.NKIObject):
     normalization_type: NormType
     normalization_weights_tensor: Optional[nl.NkiTensor]
     normalization_bias_tensor: Optional[nl.NkiTensor]
@@ -381,7 +381,7 @@ class MLPNormalizationParameters(NKIObject):
 
 
 @dataclass
-class MLPExpertParameters(NKIObject):
+class MLPExpertParameters(nl.NKIObject):
     expert_affinities: nl.NkiTensor
     expert_index: nl.NkiTensor
     expert_affinities_eager: Optional[nl.NkiTensor]
@@ -399,7 +399,7 @@ class MLPExpertParameters(NKIObject):
 
 
 @dataclass
-class MLPBiasParameters(NKIObject):
+class MLPBiasParameters(nl.NKIObject):
     gate_proj_bias_tensor: Optional[nl.NkiTensor]
     up_proj_bias_tensor: Optional[nl.NkiTensor]
     down_proj_bias_tensor: Optional[nl.NkiTensor]
@@ -443,7 +443,7 @@ class MLPBiasParameters(NKIObject):
 
 
 @dataclass
-class MLPParameters(NKIObject):
+class MLPParameters(nl.NKIObject):
     hidden_tensor: nl.NkiTensor
     gate_proj_weights_tensor: nl.NkiTensor
     up_proj_weights_tensor: nl.NkiTensor

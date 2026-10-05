@@ -20,7 +20,6 @@ from typing import Optional
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.language import NKIObject
 
 from ...utils.allocator import SbufManager
 from ...utils.kernel_helpers import (
@@ -41,7 +40,7 @@ BN_AGGR_ELEMENTS_PER_TILE = 2
 
 
 @dataclass(frozen=True)
-class MlpBxsIndices(NKIObject):
+class MlpBxsIndices(nl.NKIObject):
     program_id: int
     shard_idx: int
     batch_idx: int
@@ -68,7 +67,7 @@ MAX_AVAILABLE_SBUF_SIZE = 224 * 1024 - 16384 - 8 - 256
 # Primary tuple that holds miscellaneous constants required by the kernel
 #
 @dataclass
-class MLPCTEConstants(NKIObject):
+class MLPCTEConstants(nl.NKIObject):
     # Compute data type used for matmuls, etc.
     compute_data_type: nki.dtype
     # Data type used for activations

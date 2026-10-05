@@ -257,10 +257,6 @@ def _attention_const_max_compute(
         _MAX_O_AUG_BANKS * nl.tile_size.gemm_stationary_fmax if has_bf16_psum else nl.tile_size.gemm_moving_fmax
     )
 
-    num_full_kv_blocks = Sk // _SK_BLOCK
-    kv_remainder = Sk % _SK_BLOCK
-    kv_remainder_tiles = kv_remainder // _P
-
     for head_idx in range(Nq):
         # Q is [d, Sq] per head, partitioned into one or more Q blocks of size
         # [d, max_sq_block_size]. Each Q block is loaded once into SBUF and stays
@@ -294,60 +290,29 @@ def _attention_const_max_compute(
                 tile_size=(_O_TILE_SIZE, d + 1),
                 element_shape=(sq_block_size, d + 1),
             )
-            # Stream full KV blocks with double-buffered prefetch
-            if num_full_kv_blocks > 0:
-                k_view = nt.blocks(
-                    k_hbm[head_idx, :, : num_full_kv_blocks * _SK_BLOCK],
-                    tile_size=(_P, d),
-                    block_size=(1, _KV_TILES_PER_BLOCK),
-                )
-                v_view = nt.blocks(
-                    v_hbm[head_idx, : num_full_kv_blocks * _SK_BLOCK, :],
-                    tile_size=(_P, d),
-                    block_size=(_KV_TILES_PER_BLOCK, 1),
-                )
-                # Both K and V have a singleton block dim (K: row=1, V: col=1).
-                # Select it away before streaming so .load() returns the tile grid directly.
-                k_stream = k_view[0, :].stream(buffer_count=2)
-                v_stream = v_view[:, 0].stream(buffer_count=2)
+            # === Continuous pipeline across all KV tiles ===
+            # nt.blocks handles non-divisible Sk: the last block has fewer tiles.
+            k_view = nt.blocks(
+                k_hbm[head_idx],
+                tile_size=(_P, d),
+                block_size=(1, _KV_TILES_PER_BLOCK),
+            )
+            v_view = nt.blocks(
+                v_hbm[head_idx],
+                tile_size=(_P, d),
+                block_size=(_KV_TILES_PER_BLOCK, 1),
+            )
+            k_stream = k_view[0, :].stream(buffer_count=2)
+            v_stream = v_view[:, 0].stream(buffer_count=2)
 
-                for kv_block_idx in nl.sequential_range(num_full_kv_blocks):
-                    k_loaded = k_stream.load(kv_block_idx)
-                    v_loaded = v_stream.load(kv_block_idx)
-                    # k_loaded has tile grid (1, 16) — select the single tile-row;
-                    # v_loaded has tile grid (16, 1) — passed directly.
-                    _process_kv_block(
-                        k_block=k_loaded[0],
-                        v_block=v_loaded,
-                        q_block=q_block,
-                        o_aug_psums=o_aug_psums,
-                        softmax_max=softmax_max,
-                        softmax_scale=softmax_scale,
-                        is_first_block=(kv_block_idx == 0),
-                    )
-
-            # Process remaining KV tokens that don't fill a complete block
-            if kv_remainder_tiles > 0:
-                rem_start = num_full_kv_blocks * _SK_BLOCK
-                k_rem_view = nt.tiles(
-                    k_hbm[head_idx, :, rem_start : rem_start + kv_remainder],
-                    tile_size=(_P, d),
-                )
-                v_rem_view = nt.tiles(
-                    v_hbm[head_idx, rem_start : rem_start + kv_remainder, :],
-                    tile_size=(_P, d),
-                )
-                k_rem_loaded = k_rem_view[0, :].load()
-                v_rem_loaded = v_rem_view[:, 0].load()
-                _process_kv_block(
-                    k_block=k_rem_loaded,
-                    v_block=v_rem_loaded,
-                    q_block=q_block,
-                    o_aug_psums=o_aug_psums,
-                    softmax_max=softmax_max,
-                    softmax_scale=softmax_scale,
-                    is_first_block=(num_full_kv_blocks == 0),
-                )
+            attention_const_max_core(
+                k_stream=k_stream,
+                v_stream=v_stream,
+                q_block=q_block,
+                o_aug_psums=o_aug_psums,
+                softmax_max=softmax_max,
+                softmax_scale=softmax_scale,
+            )
 
             # Normalize each output tile by its accumulated sum_exp, then store to HBM
             o_block_start = q_block_idx * (max_sq_block_size // _O_TILE_SIZE)
@@ -356,89 +321,128 @@ def _attention_const_max_compute(
                 o_tiles[o_block_start + output_tile_idx, 0].store(o_out)
 
 
-def _process_kv_block(
-    k_block,
-    v_block,
-    q_block,
-    o_aug_psums,
-    softmax_max,
-    softmax_scale,
-    is_first_block,
-):
-    """Process one KV block: scores (MM1) → exp → weighted accumulation (MM2).
-
-    V is augmented with a ones column [V|1] so that MM2 simultaneously accumulates
-    the weighted output and sum_exp into o_aug_psums.
+def attention_const_max_core(
+    k_stream: nt.BlockStream,
+    v_stream: nt.BlockStream,
+    q_block: nl.NkiTensor,
+    o_aug_psums: nt.NDSlice,
+    softmax_max: Union[float, nl.NkiTensor],
+    softmax_scale: Optional[float] = None,
+) -> None:
+    """Compute scaled dot-product attention for one query block over all KV tiles.
 
     Args:
-        k_block: NDSlice, 1-D tile grid of K tiles in SBUF — each tile is (128, 128)
-        v_block: NDSlice, (num_kv_tiles, 1) tile grid in SBUF — each tile is (128, d)
-        q_block: [d, sq_block_size] in SBUF — pre-scaled Q block
-        o_aug_psums: NDSlice (psum_pool) — grid of [_O_TILE_SIZE, d+1] PSUM accumulators
-        softmax_max: pre-signed max for the exp path — a float, or a per-partition [_P, 1]
-            SBUF tensor. Positive for the vector_engine exponential's max_value, negated for the
-            activation bias (see _prepare_softmax_max).
-        is_first_block: if True, first write to o_aug (no accumulate)
+        k_stream (nt.BlockStream): Key tiles to attend over.
+        v_stream (nt.BlockStream): Value tiles to attend over.
+        q_block (nl.NkiTensor): [d, sq_block_size] query block.
+        o_aug_psums (nt.NDSlice): Output accumulator, one [sq_tile_size, d + 1]
+            tile per query slice, holding the unnormalized output and the softmax
+            denominator. Written in place.
+        softmax_max (Union[float, nl.NkiTensor]): Max subtracted for numerical
+            stability. Scalar or [P_MAX, 1] tensor.
+        softmax_scale (Optional[float]): Query-key scaling factor.
+
+    Returns:
+        None: Results are written in place into ``o_aug_psums``.
+
+    Pipeline (P = prologue_depth):
+        Prologue  (kv_tile_idx 0..P-1):        v_copy, MM1, exp
+        Steady-state (kv_tile_idx P..total-1):  v_copy, MM1, exp, MM2(i-P)
+        Epilogue  (drain last P):               MM2
+
     """
     d = _P
-    num_kv_tiles = k_block.shape[0]
+    num_blocks = len(k_stream)
+    sq_block_size = q_block.shape[1]
     num_output_tiles = o_aug_psums.shape[0]
 
     scores_dtype = nl.bfloat16 if nisa.get_nc_version() >= nisa.nc_version.gen4 else nl.float32
-    sq_block_size = o_aug_psums.element_shape[0]
-
     copy_engine = nisa.engine.scalar if _has_vector_engine_exp() else nisa.engine.vector
 
-    # Triple-buffer V_aug only when the copy runs on the Vector engine (gen3): the extra
-    # rotating buffer relaxes the write-after-read hazard on buffer reuse, so the next tile's
-    # copy starts earlier and MM2 (tensor engine) stalls less. When the copy is on the Scalar
-    # engine (gen4) a third buffer perturbs an already well-packed schedule, so double-buffer.
-    #
-    # V tiles are DMA-loaded from HBM into a temporary SBUF tensor (v_block), then copied
-    # into the augmented buffer (v_aug_all) via tensor_copy. This two-step pattern gives
-    # better DMA performance than loading directly into the augmented layout, and the
-    # tensor_copy overlaps well with TensorE compute so it doesn't stall MM2.
-    num_v_aug_buffers = 3 if copy_engine == nisa.engine.vector else 2
-    # Single allocation for all rotating buffers; ones column memset in one instruction.
+    # Number of MM1+exp tiles computed before first MM2 fires. Gives TensorE
+    # a buffer of ready probabilities so it can always issue MM2 without waiting.
+    prologue_depth = min(8, num_blocks * _KV_TILES_PER_BLOCK)
+
+    # Rotating V_aug buffers: need prologue_depth+1 (v_copy runs at MM1 time,
+    # MM2 consumes prologue_depth iterations later; +1 to avoid WAR)
+    num_v_aug_buffers = prologue_depth + 1
     v_aug_all = nl.ndarray(shape=(_P, num_v_aug_buffers, d + 1), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.memset(v_aug_all[:, :, d : d + 1], 1.0)
 
-    nisa.tensor_copy(dst=v_aug_all[:, 0, :d], src=v_block[0, 0].data, engine=copy_engine)
+    num_prob_buffers = prologue_depth + 1
+    probs_all = nl.ndarray(shape=(_P, num_prob_buffers, sq_block_size), dtype=nl.bfloat16, buffer=nl.sbuf)
 
-    for kv_tile_idx in range(num_kv_tiles):
-        cur_v_aug = v_aug_all[:, kv_tile_idx % num_v_aug_buffers, :]
+    kv_tile_idx = 0  # flat index across all KV blocks
 
-        # Copy next V tile into the next rotating buffer
-        if kv_tile_idx < num_kv_tiles - 1:
-            nisa.tensor_copy(
-                dst=v_aug_all[:, (kv_tile_idx + 1) % num_v_aug_buffers, :d],
-                src=v_block[kv_tile_idx + 1, 0].data,
-                engine=copy_engine,
-            )
+    for block_idx in range(num_blocks):
+        k_block = k_stream.load(block_idx)[0]
+        v_block = v_stream.load(block_idx)
+        tiles_in_block = k_block.shape[0]
 
-        # MM1: Q @ K_tile.T → scores [128 Sk tokens, sq_block_size] in PSUM
-        scores = nl.ndarray(shape=(_P, sq_block_size), dtype=scores_dtype, buffer=nl.psum)
-        nisa.nc_matmul(dst=scores, stationary=k_block[kv_tile_idx].data, moving=q_block)
+        with nl.no_reorder():
+            for local_tile in range(tiles_in_block):
+                v_buf = kv_tile_idx % num_v_aug_buffers
+                prob_buf = kv_tile_idx % num_prob_buffers
 
-        # Fused eviction + exp: P = exp(scores * scale - max).
-        # On the exponential path, Q was pre-scaled so scores are already scaled;
-        # on the activation path, scale is fused here (one fewer instruction per Q block).
-        probabilities = nl.ndarray(shape=(_P, sq_block_size), dtype=nl.bfloat16, buffer=nl.sbuf)
-        if _has_vector_engine_exp():
-            nisa.exponential(dst=probabilities, src=scores, max_value=softmax_max)
-        else:
-            nisa.activation(dst=probabilities, data=scores, op=nl.exp, scale=softmax_scale, bias=softmax_max)
+                # v_copy(i) — capture V tile now while block buffer is valid
+                nisa.tensor_copy(
+                    dst=v_aug_all[:, v_buf, :d],
+                    src=v_block[local_tile, 0].data,
+                    engine=copy_engine,
+                )
 
-        # MM2: P @ [V|1] → accumulate into O_aug [sq_tile_size, d+1] (tiled along Sq)
-        should_accumulate = not (is_first_block and kv_tile_idx == 0)
-        for output_tile_idx in range(num_output_tiles):
-            sq_tile_size = o_aug_psums[output_tile_idx].data.shape[0]
-            nisa.nc_matmul(
-                dst=o_aug_psums[output_tile_idx].data,
-                stationary=probabilities[:, nl.ds(output_tile_idx * _O_TILE_SIZE, sq_tile_size)],
-                moving=cur_v_aug,
-                accumulate=should_accumulate,
-            )
+                # MM1(i)
+                scores = nl.ndarray(shape=(_P, sq_block_size), dtype=scores_dtype, buffer=nl.psum)
+                nisa.nc_matmul(dst=scores, stationary=k_block[local_tile].data, moving=q_block)
+
+                # exp(i) — fused evict + scale + subtract-max + exp
+                if _has_vector_engine_exp():
+                    nisa.exponential(dst=probs_all[:, prob_buf, :], src=scores, max_value=softmax_max)
+                else:
+                    nisa.activation(
+                        dst=probs_all[:, prob_buf, :],
+                        data=scores,
+                        op=nl.exp,
+                        scale=softmax_scale,
+                        bias=softmax_max,
+                    )
+
+                # MM2(i-P) — only after prologue is filled
+                prologue_filled = kv_tile_idx >= prologue_depth
+                if prologue_filled:
+                    consume_idx = kv_tile_idx - prologue_depth
+                    consume_v_buf = consume_idx % num_v_aug_buffers
+                    consume_prob_buf = consume_idx % num_prob_buffers
+                    should_accumulate = consume_idx != 0
+                    cur_v_aug = v_aug_all[:, consume_v_buf, :]
+                    for ot_idx in range(num_output_tiles):
+                        sq_tile_size = o_aug_psums[ot_idx].data.shape[0]
+                        nisa.nc_matmul(
+                            dst=o_aug_psums[ot_idx].data,
+                            stationary=probs_all[:, consume_prob_buf, nl.ds(ot_idx * _O_TILE_SIZE, sq_tile_size)],
+                            moving=cur_v_aug,
+                            accumulate=should_accumulate,
+                        )
+
+                kv_tile_idx += 1
+
+    # === Epilogue: drain remaining prologue_depth MM2s ===
+    total_tiles = kv_tile_idx  # actual count (last block may be partial)
+    with nl.no_reorder():
+        for i in range(prologue_depth):
+            drain_idx = total_tiles - prologue_depth + i
+            drain_v_buf = drain_idx % num_v_aug_buffers
+            drain_prob_buf = drain_idx % num_prob_buffers
+            should_accumulate = drain_idx != 0
+            drain_v_aug = v_aug_all[:, drain_v_buf, :]
+            for ot_idx in range(num_output_tiles):
+                sq_tile_size = o_aug_psums[ot_idx].data.shape[0]
+                nisa.nc_matmul(
+                    dst=o_aug_psums[ot_idx].data,
+                    stationary=probs_all[:, drain_prob_buf, nl.ds(ot_idx * _O_TILE_SIZE, sq_tile_size)],
+                    moving=drain_v_aug,
+                    accumulate=should_accumulate,
+                )
 
 
 def _normalize(o_aug_psum):

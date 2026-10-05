@@ -178,6 +178,11 @@ def _perform_intermediate_row_quantization(
     for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
         p_bxs_size = bxs_dim_tile.get_subtile_bound(bxs_tile_idx, bxs_subtile_idx)
 
+        # The last BxS tile can be partial, leaving trailing subtiles with no valid rows.
+        # Skip them: engines require a partition count in [1, 128], zero is rejected.
+        if p_bxs_size <= 0:
+            continue
+
         if mlp_params.quant_params.has_clipping_bound():
             nisa.tensor_scalar(
                 dst=src_proj_res_sbuf_view_list[bxs_subtile_idx][:p_bxs_size, : mlp_params.intermediate_size],

@@ -21,25 +21,20 @@ the activation checkpoints, then delegates to the dropless impl. Returns the
 layer output plus the checkpoints the backward consumes.
 """
 
-from typing import Optional
-
-import nki
 import nki.language as nl
 from nki.dtype import float8_e4m3fn_x4
 
 from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.kernel_helpers import div_ceil
-from ...moe.bwd.moe_bwd_parameters import ActFnType, AffinityOption, ClampLimits, ShardOption, SkipMode
-from ...mxfp_utils.mxfp8_utils.common_dataclasses import TensorDescriptor
-from ..moe_mxfp8_checkpoint_config import MXFP8MOECheckpointConfig, checkpoint_block_dims
+from ...moe.bwd.moe_bwd_parameters import ActFnType, AffinityOption, ShardOption
+from ...mxfp_utils.mxfp8_utils.common_dataclasses import QuantScheme, TensorDescriptor
+from ..moe_mxfp8_checkpoint_config import checkpoint_block_dims
 from .bwmm_fwd_dropless_mxfp8 import blockwise_mm_fwd_dropless_mxfp8
-from .moe_fwd_mxfp8_config import MatmulMxfp8KernelConfig, MXFP8MOEFwdConfig, auto_generate_moe_fwd_configs
+from .config import MXFP8MOEFwdConfig, auto_generate_moe_fwd_configs
 
 
 def _validate_kernel_options(
     config: MXFP8MOEFwdConfig,
-    activation_type: ActFnType,
-    run_with_lnc2: bool,
     gate_up_weight_scales=None,
     down_weight_scales=None,
 ):
@@ -53,39 +48,49 @@ def _validate_kernel_options(
         "blockwise_mm_fwd_mxfp8 currently only supports AFFINITY_ON_I",
     )
 
-    # Pre-quantized weights are not yet supported in the forward: the forward
-    # contracts over different axes than the backward, so it needs a distinct
-    # forward-natural x4 layout (gate_up [E, H/4, 2*I_TP], down [E, I_TP/4, H])
-    # plus matching MX scales. That layout is not yet produced/validated.
-    # TODO(moe-fwd / M5): add forward weight prequantization + enable this path.
-    kernel_assert(
-        gate_up_weight_scales is None and down_weight_scales is None,
-        "blockwise_mm_fwd_mxfp8 does not yet support pre-quantized weights",
-    )
+    # Pre-quantized weights arrive in the forward-natural x4 layout (gate_up
+    # [E, 2*H/4, I_TP], down [E, I_TP/4, H]) plus their MX scales, so the on-chip
+    # quantize path is skipped and the matmul consumes the weight directly. The x4
+    # data must be swizzled with the SAME K permutation as the activation load mode:
+    # WRAPX (the DGT / fast_dma_transpose default) or 1x32 (use_1x32_pe_swizzle). The
+    # caller (weight producer) is responsible for matching the two; the dropless sets
+    # quant_scheme=_1x32 on the weight TDs when use_1x32_pe_swizzle is on.
     kernel_assert(
         config.shard_option == ShardOption.SHARD_ON_BLOCK,
         "blockwise_mm_fwd_mxfp8 currently only supports SHARD_ON_BLOCK",
     )
     kernel_assert(
-        activation_type == ActFnType.SiLU,
+        config.activation_type == ActFnType.SiLU,
         "only ActFnType.SiLU is implemented in blockwise_mm_fwd_mxfp8",
     )
     kernel_assert(config.fp8_x4_dtype == float8_e4m3fn_x4, "Only E4M3 is tested, E5M2 works, but not tested")
-    kernel_assert(run_with_lnc2 == True, "Kernel is expected to run only with LNC2")
     kernel_assert(config.compute_dtype == nl.bfloat16, "Only BF16 is supported, DGT does not support FP32")
     # Fast DMA transpose only supports the single-expert (E=1) case: the fast DGT
     # loader addresses the source directly and carries no per-expert offset, so it
-    # is gated to the contiguous no_indirect_load path (which asserts E == 1).
+    # is gated to the contiguous single_expert_dense path (which asserts E == 1).
     kernel_assert(
-        not config.fast_dma_transpose or config.no_indirect_load,
-        "fast_dma_transpose only supports the E=1 case (requires no_indirect_load=True)",
+        not config.fast_dma_transpose or config.single_expert_dense,
+        "fast_dma_transpose only supports the E=1 case (requires single_expert_dense=True)",
+    )
+    # The 1x32 PE-swizzle loader addresses the source directly (no per-expert
+    # offset), so like fast_dma_transpose it is gated to the contiguous E=1 path.
+    kernel_assert(
+        not config.use_1x32_pe_swizzle or config.single_expert_dense,
+        "use_1x32_pe_swizzle only supports the E=1 case (requires single_expert_dense=True)",
+    )
+    # fast_dma_transpose (DGT) and use_1x32_pe_swizzle (1x32 PE swizzle) are two
+    # different swizzle mappings for the same operands; enabling both would leave
+    # the operand load path ambiguous.
+    kernel_assert(
+        not (config.use_1x32_pe_swizzle and config.fast_dma_transpose),
+        "use_1x32_pe_swizzle and fast_dma_transpose are mutually exclusive load modes",
     )
     # Reusing one quantized weight copy across blocks is only correct when every
-    # block uses the same expert. no_indirect_load asserts E == 1, making that a
+    # block uses the same expert. single_expert_dense asserts E == 1, making that a
     # compile-time fact; the routed path would need a runtime same-expert predicate.
     kernel_assert(
-        not config.reuse_spilled_weights or config.no_indirect_load,
-        "reuse_spilled_weights requires no_indirect_load=True (E=1)",
+        not config.reuse_spilled_weights or config.single_expert_dense,
+        "reuse_spilled_weights requires single_expert_dense=True (E=1)",
     )
 
 
@@ -98,14 +103,17 @@ def _validate_inputs_and_derive_dims(
     expert_affinities_masked,
     block_size,
     num_shards,
-    no_indirect_load=False,
+    single_expert_dense=False,
+    gate_up_weight_scales=None,
+    down_weight_scales=None,
 ):
     """Validate raw inputs and return derived dims (T, H, I_TP, E, N) as plain ints.
 
     Mirrors the backward's validator but on the forward's input set (no
     output_hidden_states_grad, no checkpoints as inputs). Activations are BF16
-    only (gathered per-block via indirect DMA, which breaks MXFP8 quant groups),
-    and weights are unswizzled BF16 (pre-quantized weights are gated off).
+    only (gathered per-block via indirect DMA, which breaks MXFP8 quant groups).
+    Weights are either unswizzled BF16 or pre-quantized MXFP8 x4 (when the
+    matching ``*_weight_scales`` are provided).
     """
     required = (
         ("hidden_states", hidden_states),
@@ -120,30 +128,51 @@ def _validate_inputs_and_derive_dims(
         tensor = entry[1]
         kernel_assert(tensor != None, f"{name} is required")
 
+    gate_up_weight_quantized = gate_up_weight_scales is not None
+    down_weight_quantized = down_weight_scales is not None
+
     T = hidden_states.shape[0]
     H = hidden_states.shape[1]
     E = down_proj_weight.shape[0]
-    # FORWARD-NATURAL weight layout (transpose of the backward's): the gate/up and
-    # down GEMMs both contract over the input dim, and the per-expert DGT load path
-    # contracts over data.shape[1] (K). So weights are stored [out, in] per expert:
-    #   gate_up: [E, 2, I_TP, H]   down: [E, H, I_TP]
-    # (Pre-quantized weights are gated off in _validate_kernel_options, so only the
-    # non-prequant layouts are handled here.)
-    I_TP = down_proj_weight.shape[2]
-    N = div_ceil(T, block_size) if no_indirect_load else token_position_to_id.shape[0] // block_size
+    # FORWARD-NATURAL weight layout (transpose of the backward's). Both GEMMs contract
+    # over the input dim (gate/up over H, down over I_TP). Two layouts per weight:
+    #   BF16 (F-by-K):   gate_up [E, I_TP, 2, H] (=[E*I_TP, 2*H])   down [E, H, I_TP]
+    #   x4 (K-by-F, /4): gate_up [E, 2*H/4, I_TP]                   down [E, I_TP/4, H]
+    # gate_up packs the "2" (gate/up) into the K axis: per intermediate channel the 2*H
+    # columns are [gate(H), up(H)], so gate/up is a K-slice (rhs_k_offset=0/H). H is read
+    # from hidden_states ([T, H]); I_TP from the down weight (its trailing dim for BF16,
+    # or dim-1 * 4 for the x4 K-by-F layout — down is unchanged by the K-slice migration).
+    if down_weight_quantized:
+        I_TP = down_proj_weight.shape[1] * 4
+    else:
+        I_TP = down_proj_weight.shape[2]
+    N = div_ceil(T, block_size) if single_expert_dense else token_position_to_id.shape[0] // block_size
 
-    # Weight ranks + full shapes (forward-natural orientation).
+    # Weight ranks + full shapes, per orientation.
     gate_up_shape = gate_up_proj_weight.shape
-    kernel_assert(
-        len(gate_up_shape) == 4 and gate_up_shape == (E, 2, I_TP, H),
-        f"gate_up_weight shape {tuple(gate_up_shape)} must match [E={E}, 2, I_TP={I_TP}, H={H}]",
-    )
+    if not gate_up_weight_quantized:
+        kernel_assert(
+            len(gate_up_shape) == 4 and gate_up_shape == (E, I_TP, 2, H),
+            f"gate_up_weight shape {tuple(gate_up_shape)} must match [E={E}, I_TP={I_TP}, 2, H={H}]",
+        )
+    else:
+        kernel_assert(
+            len(gate_up_shape) == 3 and gate_up_shape == (E, 2 * H // 4, I_TP),
+            f"pre-quantized gate_up_weight shape {tuple(gate_up_shape)} must match "
+            f"[E={E}, 2*H/4={2 * H // 4}, I_TP={I_TP}]",
+        )
 
     down_shape = down_proj_weight.shape
-    kernel_assert(
-        len(down_shape) == 3 and down_shape == (E, H, I_TP),
-        f"down_weight shape {tuple(down_shape)} must match [E={E}, H={H}, I_TP={I_TP}]",
-    )
+    if not down_weight_quantized:
+        kernel_assert(
+            len(down_shape) == 3 and down_shape == (E, H, I_TP),
+            f"down_weight shape {tuple(down_shape)} must match [E={E}, H={H}, I_TP={I_TP}]",
+        )
+    else:
+        kernel_assert(
+            len(down_shape) == 3 and down_shape == (E, I_TP // 4, H),
+            f"pre-quantized down_weight shape {tuple(down_shape)} must match [E={E}, I_TP/4={I_TP // 4}, H={H}]",
+        )
 
     # Activations: [T, H], BF16/FP16 only.
     hs_shape = hidden_states.shape
@@ -160,14 +189,14 @@ def _validate_inputs_and_derive_dims(
     # packed one expert's tokens, so routing tensors are single-entry dummies.
     tpti_shape = token_position_to_id.shape
     bte_shape = block_to_expert.shape
-    if no_indirect_load:
+    if single_expert_dense:
         kernel_assert(
             len(tpti_shape) == 1 and tpti_shape[0] == 1,
-            f"no_indirect_load expects dummy token_position_to_id shape [1], got {tuple(tpti_shape)}",
+            f"single_expert_dense expects dummy token_position_to_id shape [1], got {tuple(tpti_shape)}",
         )
         kernel_assert(
             len(bte_shape) == 2 and bte_shape == (1, 1),
-            f"no_indirect_load expects dummy block_to_expert shape [1, 1], got {tuple(bte_shape)}",
+            f"single_expert_dense expects dummy block_to_expert shape [1, 1], got {tuple(bte_shape)}",
         )
     else:
         kernel_assert(
@@ -201,50 +230,27 @@ def _validate_inputs_and_derive_dims(
         f"got N={N} < num_shards={num_shards} (T={T}, block_size={block_size}). "
         f"Single-block (N < num_shards) is not yet supported.",
     )
-    if no_indirect_load:
-        kernel_assert(E == 1, f"no_indirect_load requires exactly one expert weight, got E={E}")
-        kernel_assert(T % block_size == 0, "no_indirect_load requires T to be divisible by block_size")
+    if single_expert_dense:
+        kernel_assert(E == 1, f"single_expert_dense requires exactly one expert weight, got E={E}")
+        kernel_assert(T % block_size == 0, "single_expert_dense requires T to be divisible by block_size")
 
     return T, H, I_TP, E, N
 
 
 def blockwise_mm_fwd_mxfp8(
     # --- Required input tensors ---
-    hidden_states: nl.ndarray,
-    expert_affinities_masked: nl.ndarray,
-    gate_up_proj_weight: nl.ndarray,
-    down_proj_weight: nl.ndarray,
-    token_position_to_id: nl.ndarray,
-    block_to_expert: nl.ndarray,
-    block_size: int,
-    # --- Optional pre-quantized weight support ---
-    gate_up_weight_scales: nl.ndarray = None,
-    gate_up_weight_is_swizzled: bool = False,
-    down_weight_scales: nl.ndarray = None,
-    down_weight_is_swizzled: bool = False,
-    # --- Per-phase matmul configs (None = default TILES_IN_BLOCK_*=1) ---
-    gate_up_config: Optional[MatmulMxfp8KernelConfig] = None,
-    down_config: Optional[MatmulMxfp8KernelConfig] = None,
-    # --- MXFP8 configuration ---
-    fp8_x4_dtype: type = float8_e4m3fn_x4,
-    spill_reload: bool = False,
-    reuse_spilled_weights: bool = False,
-    use_scale_packing: bool = True,
-    fast_dma_transpose: bool = False,
-    run_with_lnc2: bool = True,
-    # --- Sharding & affinity placement ---
-    shard_option: ShardOption = ShardOption.SHARD_ON_BLOCK,
-    affinity_option: AffinityOption = AffinityOption.AFFINITY_ON_I,
-    # --- Compute / DMA / accumulation knobs ---
-    compute_dtype: nki.dtype = nl.bfloat16,
-    skip_dma: SkipMode = None,
-    is_tensor_update_accumulating: bool = True,
-    no_indirect_load: bool = False,
-    clamp_limits: ClampLimits = None,
-    activation_type: ActFnType = ActFnType.SiLU,
-    bias: bool = False,
-    # --- Checkpoint emission ---
-    checkpoint_config: Optional[MXFP8MOECheckpointConfig] = None,
+    hidden_states: nl.NkiTensor,
+    expert_affinities_masked: nl.NkiTensor,
+    gate_up_proj_weight: nl.NkiTensor,
+    down_proj_weight: nl.NkiTensor,
+    token_position_to_id: nl.NkiTensor,
+    block_to_expert: nl.NkiTensor,
+    block_size: int = 4096,
+    # --- Fused kernel configuration (all non-tensor knobs live here) ---
+    config: MXFP8MOEFwdConfig = None,
+    # --- Optional pre-quantized weight scales (enables the MXFP8 x4 weight path) ---
+    gate_up_weight_scales: nl.NkiTensor = None,
+    down_weight_scales: nl.NkiTensor = None,
 ) -> tuple:
     """MXFP8 forward pass for blockwise (dropless) Mixture of Experts.
 
@@ -256,7 +262,7 @@ def blockwise_mm_fwd_mxfp8(
 
     Only weights support pre-quantized MXFP8 inputs. Activations (hidden_states)
     must be BF16 because they are gathered per-block via indirect DMA, which would
-    break MXFP8 32-element quantization groups. When no_indirect_load is True,
+    break MXFP8 32-element quantization groups. When single_expert_dense is True,
     hidden_states must already contain block-aligned tokens for one expert and
     both weight tensors must have E=1.
 
@@ -269,111 +275,110 @@ def blockwise_mm_fwd_mxfp8(
         N: total blocks ((T*top_k - (E-1)) / B + (E-1))
 
     Args:
-        hidden_states (nl.ndarray): [T, H], input hidden states (BF16) on HBM.
-        expert_affinities_masked (nl.ndarray): [T*E, 1], expert affinities (fp32) on HBM.
-        gate_up_proj_weight (nl.ndarray): [E, 2, I_TP, H], gate/up weights on HBM
-            in forward-natural [out, in] orientation (the transpose of the
-            backward's [E, H, 2, I_TP]). The forward GEMMs contract over the input
-            dim H, so the per-expert DGT load needs H as the contraction axis.
-        down_proj_weight (nl.ndarray): [E, H, I_TP], down weights on HBM in
-            forward-natural [out, in] orientation (transpose of the backward's
-            [E, I_TP, H]); the down GEMM contracts over I_TP.
-        token_position_to_id (nl.ndarray): [N*B] int32, token -> block-position map
+        hidden_states (nl.NkiTensor): [T, H], input hidden states (BF16) on HBM.
+        expert_affinities_masked (nl.NkiTensor): [T*E, 1], expert affinities (fp32) on HBM.
+        gate_up_proj_weight (nl.NkiTensor): gate/up weights on HBM in forward-natural
+            orientation. BF16: [E, I_TP, 2, H], reinterpreted [E, I_TP, 2*H] (F-by-K,
+            F=I_TP, K=2*H): per intermediate channel the 2*H columns are [gate(H), up(H)]
+            contiguous (the transpose of the backward's [E, H, 2, I_TP]). The forward
+            GEMMs contract over H, so gate/up is a K-slice of the 2*H weight (gate K in
+            [0,H), up K in [H,2H)) via rhs_k_offset while the hidden LHS stays H-long.
+            When gate_up_weight_scales is provided the weight is pre-quantized MXFP8 x4
+            in the K-by-F layout [E, 2*H/4, I_TP] (K=2*H packed by 4 on dim-1).
+        down_proj_weight (nl.NkiTensor): down weights on HBM in forward-natural
+            orientation. BF16: [E, H, I_TP] (F-by-K, transpose of the backward's
+            [E, I_TP, H]); the down GEMM contracts over I_TP. When down_weight_scales
+            is provided the weight is pre-quantized MXFP8 x4 in the K-by-F layout
+            [E, I_TP/4, H] (K=I_TP packed by 4 on dim-1).
+        token_position_to_id (nl.NkiTensor): [N*B] int32, token -> block-position map
             (pad id = -1 under skip_dma). Use a dummy [1] tensor when
-            no_indirect_load is True.
-        block_to_expert (nl.ndarray): [N, 1] int32, expert index per block. Use
-            a dummy [1, 1] tensor when no_indirect_load is True.
+            single_expert_dense is True.
+        block_to_expert (nl.NkiTensor): [N, 1] int32, expert index per block. Use
+            a dummy [1, 1] tensor when single_expert_dense is True.
         block_size (int): tokens per block (128/256/512/1024/2048/4096).
-        gate_up_weight_scales (nl.ndarray, optional): MXFP8 scales for pre-quantized gate/up.
-        gate_up_weight_is_swizzled (bool): whether gate/up weights are pre-swizzled.
-        down_weight_scales (nl.ndarray, optional): MXFP8 scales for pre-quantized down.
-        down_weight_is_swizzled (bool): whether down weights are pre-swizzled.
-        gate_up_config / down_config (MatmulMxfp8KernelConfig, optional): per-phase
-            matmul blocking. When None, defaults are used.
-        fp8_x4_dtype (type): MXFP8 packed weight dtype (default float8_e4m3fn_x4).
-        spill_reload (bool): spill quantized tiles to HBM for K-block reuse.
-        reuse_spilled_weights (bool): carry quantized weight spill buffers across the
-            block loop so only the first block each core loads+quantizes weights.
-            Requires no_indirect_load=True (E=1); only affects phases that spill.
-            Default False.
-        use_scale_packing (bool): packed MXFP8 scale layout.
-        fast_dma_transpose (bool): load unswizzled-BF16 operands via the direct-4D
-            DGT access pattern (no vector_offset_pattern SBUF buffers). Only valid
-            with no_indirect_load=True (the fast loader ignores per-expert
-            scalar_offset); the dropless impl asserts this. Default False.
-        run_with_lnc2 (bool): shard across 2 LNC cores.
-        shard_option (ShardOption): sharding strategy (default SHARD_ON_BLOCK).
-        affinity_option (AffinityOption): affinity placement; must match the backward
-            (AFFINITY_ON_I — the forward folds affinity on the intermediate).
-        compute_dtype (nki.dtype): dtype for SBUF/HBM intermediates + checkpoints (bf16).
-        skip_dma (SkipMode): OOB handling for indirect-DMA token gather/scatter.
-        is_tensor_update_accumulating (bool): when True (top_k>1) the output scatter
-            does read-modify-write so experts touching the same token accumulate.
-            Ignored when no_indirect_load is True because direct outputs do not scatter.
-        no_indirect_load (bool): use contiguous single-expert inputs/weights and skip
-            token-index gather, expert-indexed weight loads, affinity gather, and scatter.
-        clamp_limits (ClampLimits): optional gate/up clamp, applied BEFORE the
-            gate_up checkpoint + SiLU so the checkpoint matches the backward.
-        activation_type (ActFnType): SiLU only (hardcoded in the dropless impl).
-        bias (bool): whether gate/up + down biases are added (reserved surface).
-        checkpoint_config (MXFP8MOECheckpointConfig, optional): per-checkpoint save
-            flags selecting which activation checkpoints the forward emits for the
-            backward. When a checkpoint is disabled the kernel skips computing +
-            storing it and does not allocate/return it. Defaults to saving both.
+        config (MXFP8MOEFwdConfig, optional): fused forward configuration carrying every
+            non-tensor knob — compute/quant dtypes, activation, sharding + affinity
+            placement, the two per-phase matmul configs (gate_up/down), the checkpoint
+            emission config, clamp limits, skip-DMA mode, and the load-mode / spill /
+            scale-packing / LNC2 flags. When None a default ``MXFP8MOEFwdConfig()`` is
+            used, so the framework can call the kernel with only the tensors +
+            ``block_size``. See ``MXFP8MOEFwdConfig`` for per-field docs and defaults.
+        gate_up_weight_scales (nl.NkiTensor, optional): MXFP8 scales for pre-quantized
+            gate/up weights. Passing scales auto-selects the pre-quantized path:
+            gate_up_proj_weight is consumed as MXFP8 x4 in the K-by-F layout
+            [E, 2*H/4, I_TP] and the on-chip quantize is skipped; when None,
+            gate_up_proj_weight is unswizzled BF16 [E, I_TP, 2, H]. The x4 swizzle scheme
+            is taken from config.gate_up_weight_td.quant_scheme (the source of truth); left
+            unset it defaults to 1x32 PE-swizzle on the single_expert_dense (E=1) path and
+            WRAPX/DGT on the routed path, with scale packing on. Set
+            config.gate_up_weight_td=TensorDescriptor(quant_scheme=QuantScheme.WRAPX) to
+            force WRAPX. The offline weight swizzle must match this scheme.
+        down_weight_scales (nl.NkiTensor, optional): MXFP8 scales for pre-quantized down
+            weights. When provided, down_proj_weight is consumed as MXFP8 x4 in the
+            K-by-F layout [E, I_TP/4, H] (same scheme resolution as gate/up); when None,
+            it is unswizzled BF16 [E, H, I_TP].
 
     Returns:
         tuple:
-            - output_hidden_states (nl.ndarray): [T, H] MoE FFN output.
-          followed by each saved checkpoint, in this fixed order (an entry is
-          present only when its checkpoint_config flag is set):
-            - gate_up_proj_act_checkpoint_T (nl.ndarray): clamped gate pre-activation
-              at [block, 0] and up at [block, 1]; present when
-              checkpoint_config.save_gate_up_proj_act. Shape follows
-              gate_up_proj_act_layout: TRANSPOSED -> [N, 2, I_TP, B] (B contiguous,
-              the backward's layout); DIRECT -> [N, 2, B, I_TP] (I_TP contiguous).
-            - scaled_intermediate_checkpoint_T (nl.ndarray): SiLU(gate)*up*EA;
-              present when checkpoint_config.save_scaled_intermediate. Shape follows
-              scaled_intermediate_layout: TRANSPOSED -> [N, I_TP, B]; DIRECT ->
-              [N, B, I_TP].
+            - output_hidden_states (nl.NkiTensor): [T, H] MoE FFN output.
+          followed by the gate/up activation checkpoint, present only when
+          config.checkpoint_config.save_gate_up_proj_act is set:
+            - gate_up_proj_act_checkpoint_T (nl.NkiTensor): clamped gate pre-activation
+              at [block, 0] and up at [block, 1]. Shape follows the store layout
+              selected by config.gate_up_proj_act_td.orientation: K_BY_F -> TRANSPOSED
+              [N, 2, I_TP, B] (B contiguous, the backward's layout); F_BY_K -> DIRECT
+              [N, 2, B, I_TP] (I_TP contiguous).
     """
-    if skip_dma == None:
-        skip_dma = SkipMode(False, False)
-    if clamp_limits == None:
-        clamp_limits = ClampLimits()
-    if checkpoint_config == None:
-        checkpoint_config = MXFP8MOECheckpointConfig()
+    if config == None:
+        config = MXFP8MOEFwdConfig()
 
-    config = MXFP8MOEFwdConfig(
-        compute_dtype=compute_dtype,
-        fp8_x4_dtype=fp8_x4_dtype,
-        activation_type=activation_type,
-        shard_option=shard_option,
-        affinity_option=affinity_option,
-        gate_up_config=gate_up_config,
-        down_config=down_config,
-        is_tensor_update_accumulating=False if no_indirect_load else is_tensor_update_accumulating,
-        no_indirect_load=no_indirect_load,
-        clamp_limits=clamp_limits,
-        skip_dma=skip_dma,
-        bias=bias,
-        checkpoint_config=checkpoint_config,
-        fast_dma_transpose=fast_dma_transpose,
-        reuse_spilled_weights=reuse_spilled_weights,
-    )
-    config.gate_up_config.spill_reload = spill_reload
-    config.gate_up_config.enable_scale_packing = use_scale_packing
-    config.down_config.spill_reload = spill_reload
-    config.down_config.enable_scale_packing = use_scale_packing
+    # single_expert_dense (E=1, top_k=1) writes disjoint output rows directly, so the
+    # per-block output scatter never accumulates; force accumulation off to match the
+    # direct path regardless of what the caller set.
+    if config.single_expert_dense:
+        config.is_tensor_update_accumulating = False
+
+    # Auto-detect pre-quantized weights (scales present) and resolve the weight load
+    # scheme from the weight TD, which is the source of truth. When the caller left the
+    # weight TD unset (None) the default is 1x32 PE-swizzle on the single_expert_dense
+    # (E=1) path and WRAPX/DGT on the routed path (1x32 is E=1-only); scale packing is on
+    # by default (config.*_config.enable_scale_packing). A caller-supplied weight TD's
+    # quant_scheme overrides it (e.g. TensorDescriptor(quant_scheme=WRAPX) forces WRAPX).
+    # The resolved scheme is folded into use_1x32_pe_swizzle so the dropless orchestrator
+    # drives the weight AND the on-the-fly activation load with one consistent scheme;
+    # this runs before _validate_kernel_options so the routed default clears the
+    # "use_1x32 requires single_expert_dense" assert without the caller touching the bool.
+    prequantized = gate_up_weight_scales is not None or down_weight_scales is not None
+    if prequantized:
+        gu_td = config.gate_up_weight_td
+        dn_td = config.down_weight_td
+        # gate/up and down share a single x4 swizzle scheme: it drives the one on-the-fly
+        # activation load, which cannot straddle two schemes. If the caller supplies both
+        # weight TDs their quant_scheme must agree.
+        kernel_assert(
+            gu_td is None or dn_td is None or gu_td.quant_scheme == dn_td.quant_scheme,
+            "gate_up and down weight quant_scheme must match, got "
+            f"{gu_td.quant_scheme if gu_td is not None else None} (gate_up) vs "
+            f"{dn_td.quant_scheme if dn_td is not None else None} (down)",
+        )
+        default_scheme = QuantScheme._1x32 if config.single_expert_dense else QuantScheme.WRAPX
+        weight_scheme = default_scheme
+        if gu_td is not None:
+            weight_scheme = gu_td.quant_scheme
+        elif dn_td is not None:
+            weight_scheme = dn_td.quant_scheme
+        config.use_1x32_pe_swizzle = weight_scheme == QuantScheme._1x32
 
     _validate_kernel_options(
         config=config,
-        activation_type=activation_type,
-        run_with_lnc2=run_with_lnc2,
         gate_up_weight_scales=gate_up_weight_scales,
         down_weight_scales=down_weight_scales,
     )
 
-    num_shards = nl.num_programs(axes=0) if run_with_lnc2 else 1
+    # LNC2 sharding is a launch fact, not a config knob: read the shard count from
+    # the grid. The kernel is only supported under LNC2 (num_shards == 2).
+    num_shards = nl.num_programs(axes=0)
+    kernel_assert(num_shards > 1, "Kernel is expected to run only with LNC2")
     T, H, I_TP, E, N = _validate_inputs_and_derive_dims(
         hidden_states=hidden_states,
         gate_up_proj_weight=gate_up_proj_weight,
@@ -383,7 +388,24 @@ def blockwise_mm_fwd_mxfp8(
         expert_affinities_masked=expert_affinities_masked,
         block_size=block_size,
         num_shards=num_shards,
-        no_indirect_load=no_indirect_load,
+        single_expert_dense=config.single_expert_dense,
+        gate_up_weight_scales=gate_up_weight_scales,
+        down_weight_scales=down_weight_scales,
+    )
+
+    # The shared MXFP8 matmul mis-computes a pre-quantized GEMM that is LOGICALLY SQUARE
+    # (contraction K == free/output N) on the mixed BF16-LHS x x4-RHS path. I_TP == H makes
+    # BOTH forward GEMMs square (gate/up: K=H, N=I_TP; down: K=I_TP, N=H), so the gate/up
+    # result is already wrong (its checkpoint fails first) -- this is NOT a down-phase issue,
+    # and it is independent of single_expert_dense, the gate/up weight slicing, tiling, and the
+    # load mode. Fail loudly until the shared matmul's square-K==N pre-quant path is fixed; real
+    # MoE shapes never have hidden == intermediate/TP (Qwen3 H=4096, I_TP in {1536, 768}).
+    # TODO(matmul-mxfp8): fix the K==N pre-quantized matmul + remove this guard.
+    kernel_assert(
+        not ((gate_up_weight_scales is not None or down_weight_scales is not None) and I_TP == H),
+        f"pre-quantized weights with I_TP == H ({I_TP}) are not yet supported: the shared MXFP8 "
+        "matmul is incorrect for a logically-square (K == N) pre-quantized GEMM; real MoE shapes "
+        "have hidden != intermediate/TP",
     )
 
     # Auto-generate the per-phase matmul configs from the derived dims. The
@@ -393,19 +415,79 @@ def blockwise_mm_fwd_mxfp8(
     # TILES_IN_LOAD_M/N) the dropless impl feeds into the matmul calls.
     auto_generate_moe_fwd_configs(config, block_size=block_size, H=H, I_TP=I_TP)
 
-    # Build TensorDescriptors locally (passed flat into the dropless impl).
-    # Pre-quantized weights are gated off in _validate_kernel_options, so weights
-    # are always unswizzled BF16 in the forward-natural [out, in] orientation.
+    # Build data-bearing TensorDescriptors locally (passed flat into the dropless
+    # impl). Weights are either unswizzled BF16 (F-by-K) or pre-quantized MXFP8 x4
+    # (K-by-F, /4); the dropless impl branches on ``weight_td.scales is None`` and the
+    # matmul API skips the on-chip quantize/spill for an already-quantized operand.
+    # For the BF16 path the layout facts (swizzle_mode / quant_scheme / orientation /
+    # scales_are_packed) come from the caller's config weight TDs (a default TensorDescriptor
+    # when unset), so a caller-supplied swizzle wins; when left at the defaults the
+    # orchestrator's fast_dma_transpose / use_1x32_pe_swizzle bools still apply. For the x4
+    # path those layout facts are auto-resolved by TensorDescriptor (quantized => is_swizzled,
+    # K_BY_F orientation, packed-scales set from the phase config) and the orchestrator applies
+    # the WRAPX/1x32 swizzle picked by the weight-TD-derived use_1x32_pe_swizzle above.
     hidden_states_td = TensorDescriptor(data=hidden_states)
 
-    # Forward-natural gate_up: [E, 2, I_TP, H] -> 2D [E*2*I_TP, H] (F-by-K,
-    # F=2*I_TP per expert, K=H). Per-expert slice via scalar_offset; the up half
-    # is the second I_TP of the F slice (selected by rhs_n_offset=I_TP).
-    gate_up_weight_td = TensorDescriptor(data=gate_up_proj_weight.reshape((E * 2 * I_TP, H)))
+    gate_up_weight_quantized = gate_up_weight_scales is not None
+    down_weight_quantized = down_weight_scales is not None
 
-    # Forward-natural down: [E, H, I_TP] -> 2D [E*H, I_TP] (F-by-K, F=H per
-    # expert, K=I_TP). Per-expert slice via scalar_offset.
-    down_weight_td = TensorDescriptor(data=down_proj_weight.reshape((E * H, I_TP)))
+    # The caller's config weight TDs are optional (None = unset); the BF16 path reads its
+    # layout facts, so fall back to a default (plain unswizzled BF16) descriptor.
+    gate_up_cfg_td = config.gate_up_weight_td if config.gate_up_weight_td is not None else TensorDescriptor()
+    down_cfg_td = config.down_weight_td if config.down_weight_td is not None else TensorDescriptor()
+
+    # Forward-natural gate_up. Per intermediate channel the K axis is [gate(H), up(H)]:
+    # gate/up is a K-slice (rhs_k_offset=0/H) and effective_k_dim=H declares the H-wide
+    # contraction window (the GEMM contracts H, not the full 2*H), so the loader clamps
+    # each K-slice to H — mirroring effective_f_dim on the free axis. Per-expert slice
+    # via scalar_offset.
+    if not gate_up_weight_quantized:
+        # BF16 [E, I_TP, 2, H] -> 2D [E*I_TP, 2*H] (F-by-K, F=I_TP, K=2*H).
+        gate_up_weight_td = TensorDescriptor(
+            data=gate_up_proj_weight.reshape((E * I_TP, 2 * H)),
+            effective_k_dim=H,
+            swizzle_mode=gate_up_cfg_td.swizzle_mode,
+            quant_scheme=gate_up_cfg_td.quant_scheme,
+            orientation=gate_up_cfg_td.orientation,
+            scales_are_packed=gate_up_cfg_td.scales_are_packed,
+        )
+    else:
+        # x4 [E, 2*H/4, I_TP] -> 2D [E*2*H/4, I_TP] (K-by-F, K/4=2*H/4, F=I_TP).
+        # Scales [E, scales_K, F_scales] -> 2D [E*scales_K, F_scales].
+        gate_up_scales_2d = gate_up_weight_scales.reshape(
+            (E * gate_up_weight_scales.shape[1], gate_up_weight_scales.shape[2])
+        )
+        gate_up_weight_td = TensorDescriptor(
+            data=gate_up_proj_weight.reshape((E * (2 * H // 4), I_TP)),
+            scales=gate_up_scales_2d,
+            effective_k_dim=H,
+            # Set scale-packing from the phase config; the TD's shape-based auto-detect is
+            # unreliable on the E-folded 2D reshape (calculate_packed_scale_shape is
+            # nonlinear in K, so the stacked-expert scales_K != the recomputed packed K).
+            scales_are_packed=config.gate_up_config.enable_scale_packing,
+        )
+
+    # Forward-natural down. Per-expert slice via scalar_offset.
+    if not down_weight_quantized:
+        # BF16 [E, H, I_TP] -> 2D [E*H, I_TP] (F-by-K, F=H, K=I_TP).
+        down_weight_td = TensorDescriptor(
+            data=down_proj_weight.reshape((E * H, I_TP)),
+            swizzle_mode=down_cfg_td.swizzle_mode,
+            quant_scheme=down_cfg_td.quant_scheme,
+            orientation=down_cfg_td.orientation,
+            scales_are_packed=down_cfg_td.scales_are_packed,
+        )
+    else:
+        # x4 [E, I_TP/4, H] -> 2D [E*I_TP/4, H] (K-by-F, K/4=I_TP/4, F=H).
+        # Scales [E, scales_K, F_scales] -> 2D [E*scales_K, F_scales].
+        down_scales_2d = down_weight_scales.reshape((E * down_weight_scales.shape[1], down_weight_scales.shape[2]))
+        down_weight_td = TensorDescriptor(
+            data=down_proj_weight.reshape((E * (I_TP // 4), H)),
+            scales=down_scales_2d,
+            # See the gate_up note: set scale-packing explicitly (auto-detect is
+            # unreliable on the E-folded reshape).
+            scales_are_packed=config.down_config.enable_scale_packing,
+        )
 
     token_position_to_id_td = TensorDescriptor(data=token_position_to_id)
     block_to_expert_td = TensorDescriptor(data=block_to_expert)
@@ -418,28 +500,27 @@ def blockwise_mm_fwd_mxfp8(
     # different cores. Checkpoints are written per-block, so no cross-core
     # aliasing there (each core owns a disjoint block subset).
     #
-    # no_indirect_load (E=1, top_k=1) writes disjoint output rows per core
+    # single_expert_dense (E=1, top_k=1) writes disjoint output rows per core
     # directly into output_hidden_states, so the scratch slabs are unnecessary
     # (skips their alloc + zero-init + reduce in the dropless impl).
-    hbm_buffer = nl.shared_hbm if run_with_lnc2 else nl.hbm
+    checkpoint_config = config.checkpoint_config
+    hbm_buffer = nl.shared_hbm if num_shards > 1 else nl.hbm
     output_hidden_states = nl.ndarray((T, H), dtype=hidden_states.dtype, buffer=hbm_buffer)
     output_slabs = (
-        None if no_indirect_load else nl.ndarray((num_shards, T, H), dtype=hidden_states.dtype, buffer=hbm_buffer)
+        None
+        if config.single_expert_dense
+        else nl.ndarray((num_shards, T, H), dtype=hidden_states.dtype, buffer=hbm_buffer)
     )
-    # Allocate each checkpoint only when its save flag is set; a disabled
-    # checkpoint is passed to the impl as None so it skips the store.
-    # Per-block trailing dims come from checkpoint_block_dims (single source of
-    # truth shared with the torch ref + test): DIRECT is token-major (the only
-    # layout the block-granular store implements), TRANSPOSED is I_TP-major (the
-    # backward's contract; not currently supported, see CheckpointLayout).
+    # Allocate the gate/up checkpoint only when its save flag is set; a disabled
+    # checkpoint is passed to the impl as None so it skips the store. The per-block
+    # trailing dims come from checkpoint_block_dims (single source of truth shared with
+    # the torch ref + test), using the store layout selected by the gate/up activation
+    # TD orientation (F_BY_K -> DIRECT token-major; K_BY_F -> TRANSPOSED I_TP-major, the
+    # backward's contract, via a block-level PE-transpose store); see CheckpointLayout.
     gate_up_proj_act_checkpoint_T = None
     if checkpoint_config.save_gate_up_proj_act:
-        gate_up_shape = (N, 2) + checkpoint_block_dims(checkpoint_config.gate_up_proj_act_layout, I_TP, block_size)
-        gate_up_proj_act_checkpoint_T = nl.ndarray(gate_up_shape, dtype=compute_dtype, buffer=hbm_buffer)
-    scaled_intermediate_checkpoint_T = None
-    if checkpoint_config.save_scaled_intermediate:
-        scaled_shape = (N,) + checkpoint_block_dims(checkpoint_config.scaled_intermediate_layout, I_TP, block_size)
-        scaled_intermediate_checkpoint_T = nl.ndarray(scaled_shape, dtype=compute_dtype, buffer=hbm_buffer)
+        gate_up_shape = (N, 2) + checkpoint_block_dims(config.gate_up_proj_act_layout, I_TP, block_size)
+        gate_up_proj_act_checkpoint_T = nl.ndarray(gate_up_shape, dtype=config.compute_dtype, buffer=hbm_buffer)
 
     blockwise_mm_fwd_dropless_mxfp8(
         hidden_states_td=hidden_states_td,
@@ -458,16 +539,13 @@ def blockwise_mm_fwd_mxfp8(
         output_hidden_states=output_hidden_states,
         output_slabs=output_slabs,
         gate_up_proj_act_checkpoint_T=gate_up_proj_act_checkpoint_T,
-        scaled_intermediate_checkpoint_T=scaled_intermediate_checkpoint_T,
     )
 
-    # Return arity tracks the save flags (mirrors the backward's bias-conditional
-    # return): each checkpoint is appended only when saved, so the test framework's
-    # positional output mapping never sees a None. Order is fixed: output first,
-    # then gate/up, then scaled intermediate.
+    # Return arity tracks the save flag (mirrors the backward's bias-conditional
+    # return): the gate/up checkpoint is appended only when saved, so the test
+    # framework's positional output mapping never sees a None. Order is fixed: output
+    # first, then the gate/up activation checkpoint.
     outputs = [output_hidden_states]
     if checkpoint_config.save_gate_up_proj_act:
         outputs.append(gate_up_proj_act_checkpoint_T)
-    if checkpoint_config.save_scaled_intermediate:
-        outputs.append(scaled_intermediate_checkpoint_T)
     return tuple(outputs)

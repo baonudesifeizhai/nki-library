@@ -14,8 +14,8 @@
 """All-to-all-v training kernels for MoE.
 
 Public kernels:
-    permute_a2av     – gather + all-to-all-v (sender side)
-    unpermute_a2av   – all-to-all-v + scatter-add (receiver side)
+    permute_a2av            - capacity-bounded gather + all-to-all-v
+    unpermute_a2av          - capacity-bounded all-to-all-v + scatter-add
 
 Internal helpers (module-private, not part of the public API; see
 ``a2av_train_utils``):

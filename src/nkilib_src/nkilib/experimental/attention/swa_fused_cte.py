@@ -125,8 +125,8 @@ def swa_fused_cte(
     num_q_heads: int = 16,
     num_kv_heads: int = 2,
     d_head: int = 64,
-    k_scale: nl.NkiTensor = None,  # [1,1] fp32 per-tensor K dequant scale; required iff k_cache is FP8
-    v_scale: nl.NkiTensor = None,  # [1,1] fp32 per-tensor V dequant scale; required iff v_cache is FP8
+    k_scale: nl.NkiTensor = None,  # [128,1] fp32 per-tensor K dequant scale; required iff k_cache is FP8
+    v_scale: nl.NkiTensor = None,  # [128,1] fp32 per-tensor V dequant scale; required iff v_cache is FP8
 ):
     """Fused GPT-OSS SWA block. Returns (out [B,S,H], k_cache, v_cache) with caches updated in place.
 
@@ -362,18 +362,17 @@ def _swa_fused_one_batch(
     stream_shuffle_broadcast(src=opb_sb[0:1, :], dst=opb_bc[:, :])
 
     # ---- FP8 KV-cache scales (resident): dequant scale on the prior load, inverse for write-back
-    # quantize. k_scale/v_scale are per-tensor [1,1] fp32. A per-partition tensor_scalar needs the
-    # scalar operand broadcast over the destination's partitions, so build [_PMAX, 1] columns (slice
-    # [:P] per op). ----
+    # quantize. k_scale/v_scale arrive as [128,1] fp32 -- the per-tensor scale replicated across all
+    # partitions, matching qkv_proj's layout so the framework can hoist a single scale tensor into both
+    # kernels. A per-partition tensor_scalar reads the [:P] slice per op, so load all _PMAX partitions
+    # directly (no broadcast needed). ----
     k_scale_sb = v_scale_sb = inv_k_scale_sb = inv_v_scale_sb = None
     k_fp8_max = _fp8_max(k_cache.dtype) if fp8_packed else 0.0
     if fp8_packed:
         k_scale_sb = alloc.alloc_sbuf_tensor(shape=(_PMAX, 1), dtype=fp32, align_to=32)
         v_scale_sb = alloc.alloc_sbuf_tensor(shape=(_PMAX, 1), dtype=fp32, align_to=32)
-        nisa.dma_copy(dst=k_scale_sb[0:1, 0:1], src=k_scale[0:1, 0:1])
-        nisa.dma_copy(dst=v_scale_sb[0:1, 0:1], src=v_scale[0:1, 0:1])
-        stream_shuffle_broadcast(src=k_scale_sb[0:1, :], dst=k_scale_sb[:, :])
-        stream_shuffle_broadcast(src=v_scale_sb[0:1, :], dst=v_scale_sb[:, :])
+        nisa.dma_copy(dst=k_scale_sb[0:_PMAX, 0:1], src=k_scale[0:_PMAX, 0:1])
+        nisa.dma_copy(dst=v_scale_sb[0:_PMAX, 0:1], src=v_scale[0:_PMAX, 0:1])
         inv_k_scale_sb = alloc.alloc_sbuf_tensor(shape=(_PMAX, 1), dtype=fp32, align_to=32)
         inv_v_scale_sb = alloc.alloc_sbuf_tensor(shape=(_PMAX, 1), dtype=fp32, align_to=32)
         nisa.reciprocal(inv_k_scale_sb[:, 0:1], k_scale_sb[:, 0:1])

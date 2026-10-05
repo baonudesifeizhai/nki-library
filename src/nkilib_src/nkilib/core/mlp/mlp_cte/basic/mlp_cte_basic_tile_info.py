@@ -17,7 +17,6 @@
 from dataclasses import dataclass
 
 import nki.language as nl
-from nki.language import NKIObject
 
 from ....utils.allocator import sizeinbytes
 from ....utils.kernel_helpers import get_ceil_aligned_size
@@ -368,7 +367,7 @@ def calc_sbuf_bound_bxs_tile_size(
 
 
 @dataclass
-class MLPCTEBasicTileInfo(NKIObject):
+class MLPCTEBasicTileInfo(nl.NKIObject):
     bxs_dim_tile: TiledDimInfo
     layer_norm_hidden_dim_tile: TiledDimInfo
     xpose_hidden_dim_tile: TiledDimInfo
