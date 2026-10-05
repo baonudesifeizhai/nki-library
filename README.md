@@ -1,3 +1,26 @@
+# Yotta Labs fork
+
+This branch carries the nkilib snapshot that ships with the Neuron SDK
+(`0.0.0.0dev0+3b542be2`, NKI 0.7 API) plus the kernel changes
+[sglang-neuron](https://github.com/yottalabsai/sglang-neuron) uses for
+Qwen3-MoE on trn2. It installs as the `yotta-nki-library` distribution and
+imports as `yotta_nkilib`, so it sits next to the SDK's bundled `nkilib`
+without replacing it: code that imports `nkilib` keeps the SDK kernels.
+
+    pip install --no-deps git+https://github.com/baonudesifeizhai/nki-library@yotta/sdk-3b542be2
+
+Changes on top of the SDK snapshot (marked `yotta` in the source):
+
+| Module | Change |
+|---|---|
+| `core/moe/moe_tkg/mlp_tkg_constants.py` | bf16 auto-allocated SBUF keeps four 1024-row gate/up and four down weight tiles in flight |
+| `core/moe/moe_tkg/all_expert_impl.py` | On LNC2 the all-expert loop is split over experts instead of over H |
+| `core/moe/moe_tkg/mlp_tkg_gate_up_projection.py` | Column-tiled gate/up loads use the hardware DGE queue |
+| `core/attention/attention_tkg*.py`, `experimental/transformer/attention_block_tkg.py` | `allow_qk_swap` argument in place of the `NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP` env switch |
+| `core/moe/moe_cte/bwmm_shard_on_block_dyn_tail.py` (new) | `bwmm_shard_on_block` with a static outer loop plus a dynamic tail |
+
+The upstream README follows.
+
 # NKI Library
 
 The NKI Library provides pre-built reference kernels you can use directly in your model development with the AWS Neuron SDK and NKI.
