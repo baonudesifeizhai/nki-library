@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by Yotta Labs: changes are marked `yotta`.
 
 """
 Attention Block TKG Kernel
@@ -162,6 +164,7 @@ def attention_block_tkg(
     seq_packed_seq_id_table: Optional[nl.NkiTensor] = None,
     seq_packed_accumulator_partial_route_table: Optional[nl.NkiTensor] = None,
     seq_packed_accumulator_group_state_route_table: Optional[nl.NkiTensor] = None,
+    allow_qk_swap: bool = True,  # yotta: see AttnTKGConfig.allow_qk_swap
 ):
     """
     Fused Attention Block for Token Generation (TKG).
@@ -277,6 +280,8 @@ def attention_block_tkg(
             scatter each row's slot partials into sequence groups. Must be supplied with the group-state route.
         seq_packed_accumulator_group_state_route_table (Optional[nl.NkiTensor]): Tensor Indirection routes that
             gather and scatter each group's persistent sequence state. Must be supplied with the partial route.
+        allow_qk_swap (bool): yotta: allow the QK-swap MM1 path where is_qk_swapped finds the shape
+            compatible (default, nkilib's behavior); False keeps the K-stationary path.
         softmax_scale (Optional[float]): Scaling factor for attention scores. If None, defaults to (1/√D) / k_scale.
             When using FP8 KV cache (k_scale/v_scale provided) and softmax_scale is None, the kernel automatically
             divides by k_scale to dequantize the KV cache values in the QK matmul, effectively setting
@@ -503,6 +508,7 @@ def attention_block_tkg(
         dtype_mode,
         CP,
         use_seq_packed_attention,
+        allow_qk_swap,  # yotta
     )
 
     B, S_tkg = config['B'], config['S_tkg']
@@ -853,6 +859,7 @@ def attention_block_tkg(
             enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
             fp8_packed=fp8_packed,
             return_cp_softmax_stats=is_CP,
+            allow_qk_swap=allow_qk_swap,  # yotta
         )
 
         # Allocate softmax stats output tensors for CP (compact tile layout, not broadcast)
@@ -1116,6 +1123,7 @@ def _validate_and_extract_config(
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     CP: int = 1,
     use_seq_packed_attention: bool = False,
+    allow_qk_swap: bool = True,  # yotta
 ) -> Dict[str, Any]:
     """
     Validate inputs and extract configuration parameters for attention block.
@@ -1387,6 +1395,7 @@ def _validate_and_extract_config(
             fp8_packed=fp8_packed,
             fuse_rope=False,
             kv_heads=kv_heads,
+            allow_swap=allow_qk_swap,  # yotta
         )
         transposed_mask = qk_swapped and not use_pos_id
         if transposed_mask:

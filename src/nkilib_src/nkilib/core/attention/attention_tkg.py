@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by Yotta Labs: changes are marked `yotta`.
 
 """
 This kernel implements attention specifically optimized for Token Generation (TKG, also known as Decode)
@@ -789,7 +791,7 @@ class AttnTileParams(nl.NKIObject):
 
     qk_swapped: bool = None
     """Whether the QK swapped layout path is active. Enabled by default on compatible shapes
-    (see is_qk_swapped); force off with NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP=1."""
+    (see is_qk_swapped); force off with AttnTKGConfig.allow_qk_swap=False (yotta)."""
 
     # Sharding parameters
     sprior_n_prgs: int = None
@@ -1296,6 +1298,7 @@ def _compute_tile_params(
         is_2byte_kv=sizeinbytes(k_prior.dtype) == 2,
         fp8_packed=cfg.fp8_packed,
         fuse_rope=cfg.fuse_rope,
+        allow_swap=cfg.allow_qk_swap,  # yotta
     )
     atp.n_sprior_tile = div_ceil(atp.s_prior, TC.p_max)  # total number of p_max-tiles across full s_prior
 

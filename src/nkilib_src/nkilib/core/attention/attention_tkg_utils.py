@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by Yotta Labs: changes are marked `yotta`.
 
 """Shared configuration, tiling constants, and helpers for the token-generation attention (attention_tkg) kernel."""
 
@@ -24,8 +26,8 @@ import nki.language as nl
 from ..utils.kernel_assert import kernel_assert
 
 # QK-swap (transposed-score, column-tiled) MM1 is enabled by default on compatible shapes.
-# Set NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP=1 to force the default (non-swap) path, e.g. for A/B testing.
-_ATTN_TKG_NO_SWAP = os.environ.get("NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP", "").lower() in ("1", "true", "yes", "on")
+# yotta: nkilib's NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP env switch is replaced by the
+# allow_swap argument of is_qk_swapped (AttnTKGConfig.allow_qk_swap).
 
 # Flash attention: use FA when s_prior > threshold, tile size = threshold
 _FA_TILE_SIZE = 8 * 1024  # 8K - serves as both threshold and tile size
@@ -111,6 +113,12 @@ class AttnTKGConfig(nl.NKIObject):
     """When True, return unnormalized attention output (sum of exp(QK-max)*V without dividing
     by the softmax denominator) and export local softmax stats (max, sum) via cp_softmax_stats_out.
     Used by CP for distributed softmax correction across ranks."""
+
+    allow_qk_swap: bool = True
+    """yotta: allow the QK-swap MM1 path (Q stationary, K streamed in through DMA
+    transposes) when is_qk_swapped finds the shape compatible. False keeps the
+    K-stationary path, which is faster for Qwen3-30B-A3B TP4 decode (B=64,
+    8 q / 1 kv heads, ctx 2048: 304 -> 226 us)."""
 
     seq_packed_slot_interleave_degree: int = 0
     """Packed attention only: override the slot multi-buffering depth.
@@ -317,6 +325,7 @@ def is_qk_swapped(
     fp8_packed: bool,
     fuse_rope: bool,
     kv_heads: int = 1,
+    allow_swap: bool = True,  # yotta: caller's choice instead of an env switch
 ) -> bool:
     """Whether the QK-swap (transposed-score, column-tiled) MM1 path is active for a config.
 
@@ -325,7 +334,7 @@ def is_qk_swapped(
     layout, and KV-load requirements below are all met. Attention, gen_mask, and the tests all call
     this one function so the swap decision stays consistent across all three.
 
-    Set ``NKILIB_EXPERIMENTAL_ATTN_TKG_NO_SWAP=1`` to force the default (K-stationary) path.
+    Pass ``allow_swap=False`` to force the default (K-stationary) path (yotta).
 
     Args:
         bs: Full batch size before LNC sharding (per KV head, i.e. B_attn — NOT yet folded with kv_heads).
@@ -362,7 +371,7 @@ def is_qk_swapped(
         ...     kv_heads=2,
         ... )
     """
-    if _ATTN_TKG_NO_SWAP:
+    if not allow_swap:  # yotta
         return False
     if not is_block_kv:
         return False
