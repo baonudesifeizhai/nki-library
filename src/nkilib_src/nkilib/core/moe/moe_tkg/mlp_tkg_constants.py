@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by Yotta Labs: changes are marked `yotta`.
 
 """Constants and configuration dataclasses for MLP TKG kernel tiling and memory allocation."""
 
@@ -33,6 +35,11 @@ from .mlp_parameters import (
     mlpp_has_layer_normalization,
     mlpp_has_rms_normalization,
 )
+
+# yotta: weight tile ring for bf16 auto-allocated SBUF (all-expert decode path).
+_GATE_UP_HTILE = 1024  # hidden rows per bf16 gate/up weight tile
+_GATE_UP_TILES = 4  # gate/up ring slots (a gate and an up tile per expert)
+_DOWN_TILES = 4  # down ring slots (I/128 tiles per expert)
 
 
 @dataclass
@@ -293,6 +300,16 @@ class MLPTKGConstants(nl.NKIObject):
             w_tile_sz = I * (HTile // dims._pmax) * w_dtype_sz
             num_required_w_tile = div_ceil(dims.H_per_shard, HTile)
             num_allocated_w_tile = 2
+            # yotta: bf16 weights get four 1024-row tiles instead of two
+            # 512-row ones, so the weight DMA runs ahead of the PE (two tiles
+            # left the PE idle ~45% of the decode MoE kernel waiting for a
+            # free slot). Fused decode MoE block, one EP rank of Qwen3-30B-A3B
+            # (E_L=64, I=384): T=64 942 -> 714 us, T=16 824 -> 666 us.
+            if not params.quant_params.is_quant():
+                HTile = min(_GATE_UP_HTILE, dims.H_per_shard)
+                w_tile_sz = I * (HTile // dims._pmax) * w_dtype_sz
+                num_required_w_tile = div_ceil(dims.H_per_shard, HTile)
+                num_allocated_w_tile = _GATE_UP_TILES
         elif share_memory_scope:
             HTile = ini_HTile
             w_tile_sz = I * (HTile // dims._pmax) * w_dtype_sz
@@ -402,7 +419,8 @@ class MLPTKGConstants(nl.NKIObject):
         if sbm.is_auto_alloc():
             return MLPTKGConstantsDownTileCounts(
                 HTile=down_HTile,
-                num_allocated_w_tile=2,
+                # yotta: four down tiles in flight for bf16 (see calculate_gate_up_tiles).
+                num_allocated_w_tile=2 if params.quant_params.is_quant() else _DOWN_TILES,
                 weight_base_idx=0,
             )
 

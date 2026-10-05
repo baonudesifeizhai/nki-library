@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by Yotta Labs: changes are marked `yotta`.
 
 """All-expert MoE token generation implementation with static and dynamic (DLoC) dispatch."""
 
@@ -308,7 +310,8 @@ def _all_expert_moe_tkg(
     if dynamism_cfg.is_all_expert_dynamic:
         return _all_expert_moe_tkg_dynamic(params, dynamism_cfg, output)
     else:
-        return _all_expert_moe_tkg_static(params, output)
+        # yotta: split the experts over the LNC2 cores (falls back to the static kernel).
+        return _all_expert_moe_tkg_expert_split(params, output)
 
 
 def _all_expert_moe_tkg_dynamic(
@@ -750,6 +753,129 @@ def _all_expert_moe_tkg_static(
 
     sbm.set_name_prefix("")
 
+    sbm.close_scope()
+    return output
+
+
+def _all_expert_moe_tkg_expert_split(params, output):
+    """yotta: all-expert MoE split over experts instead of H on LNC2.
+
+    nkilib's static kernel splits every expert's MLP over the two physical
+    cores along H, so each expert's gate/up partial sums cross between the
+    cores twice (sendrecv) on the PE's critical path. Here each core runs half
+    of the experts over the full H, with no exchange until one final sum of
+    the two partial outputs. One EP rank of Qwen3-30B-A3B (64 local experts,
+    I=384) at T=64: 714 -> 577 us (fused decode MoE block).
+
+    Covers a single T tile without quantization; other shapes run
+    _all_expert_moe_tkg_static.
+    """
+    _, n_prgs, prg_id = get_verified_program_sharding_info()
+    E = params.gate_proj_weights_tensor.shape[0]
+    T = params.batch_size * params.sequence_len
+    hidden_in_sbuf = params.hidden_tensor.buffer == nl.sbuf
+    if (n_prgs != 2 or E % 2 != 0 or T > 128 or params.transposed_out
+            or params.quant_params.quantization_type != QuantizationType.NONE
+            or output.buffer == nl.sbuf):
+        return _all_expert_moe_tkg_static(params, output)
+
+    io_dtype = params.hidden_tensor.dtype
+    expert_affinities = params.expert_params.expert_affinities
+    expert_affinities_in_sbuf = expert_affinities.buffer == nl.sbuf
+
+    # Full-H dims on each core: H1_shard == H1, no per-expert exchange.
+    params.shard_on_h_disabled = True
+    # From T=32 the gate/up matmuls keep the tokens stationary and pack two
+    # H slices side by side on the PE (column tiling): T=64 577 -> 548 us,
+    # where the kernel reaches its weight-DMA floor.
+    params.use_tkg_gate_up_proj_column_tiling = 32 <= T
+    dims = MLPTKGConstants.calculate_constants(params)
+    t_cfg = _create_token_tiling_config(dims)
+    H0, H1 = dims.H0, dims.H1
+
+    sbm = SbufManager(0, 200000, get_logger("all_expert_moe_tkg_split"), use_auto_alloc=True)
+    sbm.open_scope()
+    allocator = sbm.alloc_stack
+
+    gate_proj_weights = params.gate_proj_weights_tensor
+    up_proj_weights = params.up_proj_weights_tensor
+    down_proj_weights = params.down_proj_weights_tensor
+    gate_proj_bias = params.bias_params.gate_proj_bias_tensor
+    up_proj_bias = params.bias_params.up_proj_bias_tensor
+    down_proj_bias = params.bias_params.down_proj_bias_tensor
+
+    # The input in the full-H layout of the weight views (h = h0 * H1 + h1).
+    full_in = allocator((H0, T, H1), dtype=io_dtype, buffer=nl.sbuf, name="split_input_sb")
+    if hidden_in_sbuf:
+        # Each core holds its H shard (h = shard * H/2 + h0 * H1/2 + h1): swap
+        # shards, then relayout through an [H, T] HBM scratch. T is innermost
+        # on both sides of the DMAs, so each partition moves one long run.
+        H1_half = H1 // 2
+        own = allocator((H0, H1_half, T), dtype=io_dtype, buffer=nl.sbuf, name="split_own_shard")
+        nisa.tensor_copy(dst=own, src=params.hidden_tensor.permute(dims=[0, 2, 1]))
+        other = allocator((H0, H1_half, T), dtype=io_dtype, buffer=nl.sbuf, name="split_other_shard")
+        nisa.sendrecv(src=own, dst=other, send_to_rank=1 - prg_id, recv_from_rank=1 - prg_id, pipe_id=0)
+        scratch = nl.ndarray((H0 * H1, T), dtype=io_dtype, buffer=nl.private_hbm)
+        sharded = scratch.reshape_dim(dim=0, shape=[2, H0, H1_half])
+        nisa.dma_copy(dst=sharded.select(dim=0, index=prg_id), src=own)
+        nisa.dma_copy(dst=sharded.select(dim=0, index=1 - prg_id), src=other)
+        full_ht = allocator((H0, H1, T), dtype=io_dtype, buffer=nl.sbuf, name="split_input_ht")
+        nisa.dma_copy(dst=full_ht, src=scratch.reshape_dim(dim=0, shape=[H0, H1]))
+        nisa.tensor_copy(dst=full_in, src=full_ht.permute(dims=[0, 2, 1]))
+        params.hidden_tensor = full_in
+    else:
+        dims.T = t_cfg.T_total
+        input_norm_load(params.hidden_tensor, full_in, params, dims, sbm=sbm, T_offset=0)
+
+    # Zeroed: nkilib copies (rather than adds) only for expert 0, which core 1 never runs.
+    output_temp = allocator((H0, H1, t_cfg.T_total), dtype=io_dtype, buffer=nl.sbuf, name="split_output_sb")
+    nisa.memset(output_temp, 0)
+    expert_affinities_sb, aff_num_tiles = load_all_expert_affinities(
+        expert_affinities, expert_affinities_in_sbuf, t_cfg.T_total, dims, allocator
+    )
+    identity_sb = nl.shared_identity_matrix(t_cfg.tile_T, dtype=io_dtype)
+    memory_safe_degree = 2 if t_cfg.tile_T * dims.H * dims.I <= 32 * 3072 * 1024 else 1
+
+    half = E // 2
+    for expertIdx in range(prg_id * half, (prg_id + 1) * half):
+        sbm.set_name_prefix(f"expert{expertIdx}_")
+        _select_expert_params(
+            params, expertIdx, gate_proj_weights, up_proj_weights, down_proj_weights,
+            gate_proj_bias, up_proj_bias, down_proj_bias, None, None, None, None, None,
+        )
+        sbm.open_scope(interleave_degree=memory_safe_degree)
+        dims.T = t_cfg.T_total
+        _compute_expert_mlp_tkg(
+            input_sb=full_in,
+            params=params,
+            dims=dims,
+            sbm=sbm,
+            allocator=allocator,
+            expert_affinities_sb=expert_affinities_sb,
+            aff_num_tiles=aff_num_tiles,
+            identity_sb=identity_sb,
+            use_auto_alloc=True,
+            io_dtype=io_dtype,
+            output_temp=output_temp,
+            expertIdx=expertIdx,
+            t_offset=0,
+            t_idx=0,
+            t_cfg=t_cfg,
+            current_tile_T=t_cfg.T_total,
+            hidden_in_sbuf=True,
+        )
+        sbm.increment_section()
+        sbm.close_scope()
+
+    # Sum the two cores' partial outputs; core 0 stores the [T, H] result.
+    partner = allocator((H0, H1, t_cfg.T_total), dtype=io_dtype, buffer=nl.sbuf, name="split_partner_sb")
+    nisa.sendrecv(src=output_temp, dst=partner, send_to_rank=1 - prg_id, recv_from_rank=1 - prg_id, pipe_id=0)
+    if prg_id == 0:
+        nisa.tensor_tensor(dst=output_temp, data1=output_temp, data2=partner, op=nl.add)
+        sbm.set_name_prefix("store_")
+        dims.T = t_cfg.T_total
+        transpose_store(output_temp, output, dims, params.output_dtype, sbm, T_offset=0)
+    sbm.set_name_prefix("")
     sbm.close_scope()
     return output
 

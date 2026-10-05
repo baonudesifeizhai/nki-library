@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified by Yotta Labs: changes are marked `yotta`.
 
 """Gate and Up projection sub-kernels for MLP TKG with column tiling and LHS/RHS swap modes."""
 
@@ -43,6 +45,11 @@ from .projection_utils import (
 
 _DGE_MODE_UNKNOWN = 0  # Compiler decides best DMA mode internally
 _DGE_MODE_NONE = 3  # Use STATIC DMA mode
+# yotta: the column-tiled path (gate_up_projection) loads its weights, bias and
+# dequant scales through the hardware DGE queue instead of static DMA, which
+# shared one queue with the down-projection weights. Fused decode MoE block,
+# one EP rank of Qwen3-30B-A3B at T=64: 577 -> 545 us (the weight-DMA floor).
+_COLUMN_TILED_DGE_MODE = nisa.dge_mode.hwdge
 
 
 def gate_up_projection(
@@ -152,7 +159,7 @@ def gate_up_projection(
         nisa.dma_copy(
             dst=bias_tile_view,
             src=bias_hbm_view,
-            dge_mode=_DGE_MODE_NONE,
+            dge_mode=_COLUMN_TILED_DGE_MODE,  # yotta
         )
 
     # ---------- Load dequant scale ----------
@@ -161,7 +168,7 @@ def gate_up_projection(
         nisa.dma_copy(
             dst=dequant_tile.slice(dim=1, start=0, end=I),
             src=dequant_scale_view,
-            dge_mode=_DGE_MODE_NONE,
+            dge_mode=_COLUMN_TILED_DGE_MODE,  # yotta
         )
 
     # ---------- Matrix multiplication ----------
@@ -184,7 +191,7 @@ def gate_up_projection(
         nisa.dma_copy(
             dst=weight_sb_tile_slice,
             src=weight_view,
-            dge_mode=_DGE_MODE_NONE,
+            dge_mode=_COLUMN_TILED_DGE_MODE,  # yotta
         )
 
         # Matmul
